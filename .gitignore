@@ -1,0 +1,25 @@
+# Local credentials and certificates
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python and local tooling
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Generated application content
+logs/
+output/
+eval_report_*.json
+data/projects/
+
+# Local Codex planning and evidence
+.omo/
