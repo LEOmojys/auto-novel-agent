@@ -1,0 +1,57 @@
+{
+  "skill_id": "targeted-revision",
+  "version": "1.0.0",
+  "status": "enabled",
+  "kind": "primary",
+  "summary": "Repair cited chapter failures",
+  "owner": "ChapterExecutor",
+  "changelog": "Initial governed release",
+  "task_types": [
+    "REPAIR"
+  ],
+  "run_states": [
+    "running"
+  ],
+  "allowed_roles": [
+    "ChapterExecutor"
+  ],
+  "genre_tags": [],
+  "input_model": "RepairBrief",
+  "output_model": "StagedChapter",
+  "required_artifact_kinds": [
+    "staged_chapter",
+    "chapter_plan"
+  ],
+  "required_context_slices": [
+    "cited_failures",
+    "chapter_plan",
+    "m5_context"
+  ],
+  "context_order": [
+    "cited_failures",
+    "chapter_plan",
+    "m5_context"
+  ],
+  "context_budget": 8000,
+  "allowed_tool_ids": [
+    "chapter.repair@1.0.0"
+  ],
+  "max_tool_calls": 2,
+  "timeout_budget": 180.0,
+  "acceptance_checks": [
+    "replacement_staged",
+    "cited_failures_addressed"
+  ],
+  "failure_strategy": "pause",
+  "max_repairs": 2,
+  "prompt_template_path": "targeted-revision-1.0.0.txt",
+  "prompt_template_hash": "e7757ed3de47c3f997500c7eafec58ab5b1ae87f231db06af21337baccdef223",
+  "examples_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "compatibility": {
+    "minimum_input": 1,
+    "maximum_input": 1,
+    "minimum_output": 1,
+    "maximum_output": 1
+  },
+  "audit_for": []
+}

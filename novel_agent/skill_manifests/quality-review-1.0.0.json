@@ -1,0 +1,56 @@
+{
+  "skill_id": "quality-review",
+  "version": "1.0.0",
+  "status": "enabled",
+  "kind": "primary",
+  "summary": "Review chapter quality",
+  "owner": "QualityReviewer",
+  "changelog": "Initial governed release",
+  "task_types": [
+    "CHECK_QUALITY"
+  ],
+  "run_states": [
+    "running"
+  ],
+  "allowed_roles": [
+    "QualityReviewer"
+  ],
+  "genre_tags": [],
+  "input_model": "QualityReviewRequest",
+  "output_model": "QualityDecision",
+  "required_artifact_kinds": [
+    "staged_chapter"
+  ],
+  "required_context_slices": [
+    "staged_chapter",
+    "quality_policy",
+    "chapter_plan"
+  ],
+  "context_order": [
+    "staged_chapter",
+    "quality_policy",
+    "chapter_plan"
+  ],
+  "context_budget": 6000,
+  "allowed_tool_ids": [
+    "quality.evaluate@1.0.0"
+  ],
+  "max_tool_calls": 2,
+  "timeout_budget": 180.0,
+  "acceptance_checks": [
+    "quality_decision_schema",
+    "evaluator_error_explicit"
+  ],
+  "failure_strategy": "pause",
+  "max_repairs": 0,
+  "prompt_template_path": "quality-review-1.0.0.txt",
+  "prompt_template_hash": "15fbd09bece15844ac160058d07ab1e4bf7eb7f8a78c96f2ba8f214deed93ee8",
+  "examples_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "compatibility": {
+    "minimum_input": 1,
+    "maximum_input": 1,
+    "minimum_output": 1,
+    "maximum_output": 1
+  },
+  "audit_for": []
+}

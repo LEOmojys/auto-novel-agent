@@ -1,0 +1,55 @@
+{
+  "skill_id": "chapter-scene",
+  "version": "1.0.0",
+  "status": "enabled",
+  "kind": "primary",
+  "summary": "Draft one staged chapter",
+  "owner": "ChapterExecutor",
+  "changelog": "Initial governed release",
+  "task_types": [
+    "DRAFT_CHAPTER"
+  ],
+  "run_states": [
+    "running"
+  ],
+  "allowed_roles": [
+    "ChapterExecutor"
+  ],
+  "genre_tags": [],
+  "input_model": "ChapterDraftRequest",
+  "output_model": "StagedChapter",
+  "required_artifact_kinds": [
+    "chapter_plan"
+  ],
+  "required_context_slices": [
+    "chapter_plan",
+    "m5_context"
+  ],
+  "context_order": [
+    "chapter_plan",
+    "m5_context"
+  ],
+  "context_budget": 8000,
+  "allowed_tool_ids": [
+    "chapter.draft@1.0.0",
+    "chapter.repair@1.0.0"
+  ],
+  "max_tool_calls": 3,
+  "timeout_budget": 180.0,
+  "acceptance_checks": [
+    "staged_chapter_schema",
+    "chapter_contract_conformance"
+  ],
+  "failure_strategy": "pause",
+  "max_repairs": 2,
+  "prompt_template_path": "chapter-scene-1.0.0.txt",
+  "prompt_template_hash": "0346ce09ae26e6aa80921797388ebf978d65832a56df25513f4b7843b23f4de4",
+  "examples_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "compatibility": {
+    "minimum_input": 1,
+    "maximum_input": 1,
+    "minimum_output": 1,
+    "maximum_output": 1
+  },
+  "audit_for": []
+}

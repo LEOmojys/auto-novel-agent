@@ -1,0 +1,50 @@
+{
+  "skill_id": "brief-normalization",
+  "version": "1.0.0",
+  "status": "enabled",
+  "kind": "primary",
+  "summary": "Normalize an intake brief",
+  "owner": "BriefPlanner",
+  "changelog": "Initial governed release",
+  "task_types": [
+    "INTAKE"
+  ],
+  "run_states": [
+    "running"
+  ],
+  "allowed_roles": [
+    "BriefPlanner"
+  ],
+  "genre_tags": [],
+  "input_model": "RawBrief",
+  "output_model": "StoryBrief",
+  "required_artifact_kinds": [],
+  "required_context_slices": [
+    "raw_brief",
+    "defaults"
+  ],
+  "context_order": [
+    "raw_brief",
+    "defaults"
+  ],
+  "context_budget": 2000,
+  "allowed_tool_ids": [],
+  "max_tool_calls": 2,
+  "timeout_budget": 120.0,
+  "acceptance_checks": [
+    "story_brief_schema",
+    "constraints_explicit"
+  ],
+  "failure_strategy": "pause",
+  "max_repairs": 1,
+  "prompt_template_path": "brief-normalization-1.0.0.txt",
+  "prompt_template_hash": "fefd16419eb9d0f068c680cabceca527f766730caa0135ee97b0fe72751ea07a",
+  "examples_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "compatibility": {
+    "minimum_input": 1,
+    "maximum_input": 1,
+    "minimum_output": 1,
+    "maximum_output": 1
+  },
+  "audit_for": []
+}

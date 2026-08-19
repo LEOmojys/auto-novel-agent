@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agent 小说创作控制台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <path d="M12 2.5 20.5 7v10L12 21.5 3.5 17V7L12 2.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+        <path d="M12 8.2 7.5 10.8v3L12 16.3l4.5-2.5v-3L12 8.2Z" fill="currentColor" opacity="0.85"/>
+      </svg>
+      <div class="brand-text">
+        <span class="brand-name">Agent 小说创作控制台</span>
+        <span class="brand-sub">Modern Agent Console</span>
+      </div>
+    </div>
+
+    <div class="topbar-fields">
+      <label class="field-label" for="project-select">项目</label>
+      <select id="project-select" title="项目"></select>
+
+      <span id="llm-status" class="llm-status" title="启动时自动检查 LLM API 连通性">LLM API: 检查中…</span>
+    </div>
+  </header>
+
+  <section class="statusbar">
+    <div id="status-badge" class="badge idle">未启动</div>
+    <div id="activity" class="activity">—</div>
+  </section>
+
+  <section class="composer">
+    <label class="field-label" for="requirements">创作需求</label>
+    <textarea id="requirements" class="requirements" rows="4"
+      placeholder="输入创作需求，如：写一本魔法学院题材的小说，主角是孤儿，20章，第一人称……"></textarea>
+
+    <div class="composer-row">
+      <div class="field">
+        <label class="field-label" for="chapter-count">目标章数</label>
+        <input id="chapter-count" type="number" min="1" max="100" placeholder="默认 10">
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="provider-select">模型 Provider</label>
+        <select id="provider-select">
+          <option value="offline_fake">offline_fake（演示）</option>
+          <option value="legacy_real">legacy_real（真实模型）</option>
+        </select>
+      </div>
+
+      <label class="check">
+        <input id="auto-approve" type="checkbox" checked>
+        <span>默认同意产物</span>
+      </label>
+
+      <div class="composer-actions">
+        <button id="start-btn" class="primary">启动运行</button>
+        <button id="pause-btn" disabled>暂停</button>
+        <button id="resume-btn" disabled>继续</button>
+        <button id="cancel-btn" disabled>取消</button>
+        <button id="repair-btn" disabled>修复重排</button>
+        <span class="sep"></span>
+        <button id="refresh-btn">刷新</button>
+        <button id="rewrite-btn" title="重写指定章节（生成新版本，确认后替换）">重写章节</button>
+        <input id="rewrite-chapter" type="number" min="1" max="100" placeholder="章号">
+        <button id="export-btn" title="将 SQLite 产物导出为旧版格式文件">导出文件</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="rebase-panel" class="panel rebase-panel" style="display:none">
+    <div class="rebase-head">
+      <span class="rebase-icon">⚠</span>
+      <div>
+        <h2>分支重建确认</h2>
+        <div id="rebase-info" class="rebase-info">该运行需要确认分支重建才能继续（下游章节保护）。</div>
+      </div>
+      <button id="rebase-btn" class="primary">确认分支重建</button>
+    </div>
+  </section>
+
+  <main class="layout">
+    <aside class="col col-left">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>任务清单</h2>
+          <span class="panel-tag">阶段化进度</span>
+        </div>
+        <div id="task-list" class="task-list"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>运行历史</h2>
+          <span class="panel-tag">点击切换</span>
+        </div>
+        <ul id="run-history" class="history"></ul>
+      </section>
+    </aside>
+
+    <section class="col col-main">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Artifact 浏览</h2>
+          <span class="panel-tag">产物仓库</span>
+        </div>
+        <div id="artifact-tabs" class="tabs"></div>
+        <div id="artifact-meta" class="meta"></div>
+        <pre id="artifact-body" class="artifact-body"></pre>
+      </section>
+
+      <section id="plan-panel" class="panel plan-panel" style="display:none">
+        <div class="panel-head">
+          <h2>执行计划确认</h2>
+          <span class="panel-tag pending-tag">等待确认</span>
+        </div>
+        <div class="meta">AI 已生成执行计划，请确认后开始执行，或重新规划。</div>
+        <ol id="plan-steps" class="plan-steps"></ol>
+        <div class="pending-actions">
+          <button id="plan-approve-btn" class="primary" disabled>确认执行</button>
+          <button id="plan-regen-btn" disabled>重新规划</button>
+        </div>
+      </section>
+
+      <section id="pending-panel" class="panel pending-panel" style="display:none">
+        <div class="panel-head">
+          <h2>待确认产物</h2>
+          <span class="panel-tag pending-tag">等待人工审核</span>
+        </div>
+        <div id="pending-meta" class="meta"></div>
+        <div id="pending-body" class="artifact-body pending-body"></div>
+        <label class="field-label" for="pending-edit">编辑内容（修改后将按新内容入库）</label>
+        <textarea id="pending-edit" class="pending-edit" rows="10"></textarea>
+        <div class="pending-actions">
+          <button id="approve-btn" class="primary" disabled>确认入库</button>
+          <button id="regenerate-btn" disabled>重新生成</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>任务图进度</h2>
+          <span class="panel-tag">依赖流程</span>
+        </div>
+        <div id="graph" class="graph"></div>
+      </section>
+    </section>
+
+    <aside class="col col-right">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>思维链</h2>
+          <span class="panel-tag">可审计执行轨迹</span>
+        </div>
+        <div id="chain" class="chain"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>工具调用</h2>
+          <span class="panel-tag">审计清单</span>
+        </div>
+        <div id="tools" class="tools"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>质量评审</h2>
+          <span class="panel-tag">评分反馈</span>
+        </div>
+        <div id="quality" class="quality"></div>
+      </section>
+    </aside>
+  </main>
+
+  <footer class="eventbar">
+    <div class="eventbar-header">事件流 <span id="event-count" class="count"></span></div>
+    <div id="events" class="events"></div>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,54 @@
+{
+  "skill_id": "plan-execution",
+  "version": "1.0.0",
+  "status": "enabled",
+  "kind": "primary",
+  "summary": "Decompose a brief into an executable step list",
+  "owner": "PlanAgent",
+  "changelog": "Initial governed release",
+  "task_types": [
+    "PLAN_EXECUTION"
+  ],
+  "run_states": [
+    "running"
+  ],
+  "allowed_roles": [
+    "OutlinePlanner"
+  ],
+  "genre_tags": [],
+  "input_model": "BriefContract",
+  "output_model": "ExecutionPlan",
+  "required_artifact_kinds": [
+    "story_brief"
+  ],
+  "required_context_slices": [
+    "story_brief"
+  ],
+  "context_order": [
+    "story_brief"
+  ],
+  "context_budget": 4000,
+  "allowed_tool_ids": [
+    "world.generate@1.0.0",
+    "character.generate@1.0.0",
+    "outline.generate@1.0.0",
+    "chapter.draft@1.0.0"
+  ],
+  "max_tool_calls": 50,
+  "timeout_budget": 180.0,
+  "acceptance_checks": [
+    "step_list_valid"
+  ],
+  "failure_strategy": "pause",
+  "max_repairs": 1,
+  "prompt_template_path": "plan-execution-1.0.0.txt",
+  "prompt_template_hash": "36df0013b2afc09c0e699c15515dabd9b3d1e6aeee3230000a8becefc74abbc8",
+  "examples_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "compatibility": {
+    "minimum_input": 1,
+    "maximum_input": 1,
+    "minimum_output": 1,
+    "maximum_output": 1
+  },
+  "audit_for": []
+}

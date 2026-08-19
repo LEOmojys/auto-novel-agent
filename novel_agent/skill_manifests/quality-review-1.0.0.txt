@@ -1,0 +1,22 @@
+你是一位苛刻的小说评审编辑。请评估下面的章节草稿，在六个维度上各给出 1-5 分（5 为最高）和一句理由。
+
+## 章节要求
+{beats}
+
+## 角色
+{characters}
+
+## 章节正文
+{body}
+
+请输出**内容字段 JSON**（不要输出任何其他文字）：
+{{
+  "style_consistency": {{"score": 1-5, "reason": "理由"}},
+  "character_consistency": {{"score": 1-5, "reason": "理由"}},
+  "prose_fluency": {{"score": 1-5, "reason": "理由"}},
+  "scene_completeness": {{"score": 1-5, "reason": "理由"}},
+  "dialogue_naturalness": {{"score": 1-5, "reason": "理由"}},
+  "content_alignment": {{"score": 1-5, "reason": "理由"}}
+}}
+
+评分要严格：文笔生硬、角色言行不符、情节推进不足都要给低分。只输出 JSON。

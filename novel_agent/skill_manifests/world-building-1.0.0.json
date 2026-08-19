@@ -1,0 +1,52 @@
+{
+  "skill_id": "world-building",
+  "version": "1.0.0",
+  "status": "enabled",
+  "kind": "primary",
+  "summary": "Build the canonical world",
+  "owner": "StoryArchitect",
+  "changelog": "Initial governed release",
+  "task_types": [
+    "PLAN_WORLD"
+  ],
+  "run_states": [
+    "running"
+  ],
+  "allowed_roles": [
+    "StoryArchitect"
+  ],
+  "genre_tags": [],
+  "input_model": "WorldRequest",
+  "output_model": "WorldBible",
+  "required_artifact_kinds": [
+    "story_brief"
+  ],
+  "required_context_slices": [
+    "story_brief"
+  ],
+  "context_order": [
+    "story_brief"
+  ],
+  "context_budget": 4000,
+  "allowed_tool_ids": [
+    "world.generate@1.0.0"
+  ],
+  "max_tool_calls": 3,
+  "timeout_budget": 180.0,
+  "acceptance_checks": [
+    "world_bible_schema",
+    "canonical_conflicts_resolved"
+  ],
+  "failure_strategy": "pause",
+  "max_repairs": 1,
+  "prompt_template_path": "world-building-1.0.0.txt",
+  "prompt_template_hash": "5128870d19c5b9b75b58ff1705648cba253495f97f82eeeab959eb3a4920643e",
+  "examples_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "compatibility": {
+    "minimum_input": 1,
+    "maximum_input": 1,
+    "minimum_output": 1,
+    "maximum_output": 1
+  },
+  "audit_for": []
+}

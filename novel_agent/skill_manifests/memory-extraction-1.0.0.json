@@ -1,0 +1,53 @@
+{
+  "skill_id": "memory-extraction",
+  "version": "1.0.0",
+  "status": "enabled",
+  "kind": "primary",
+  "summary": "Extract evidence-backed candidates",
+  "owner": "MemoryExtractor",
+  "changelog": "Initial governed release",
+  "task_types": [
+    "MEMORY_EXTRACTION"
+  ],
+  "run_states": [
+    "running"
+  ],
+  "allowed_roles": [
+    "MemoryExtractor"
+  ],
+  "genre_tags": [],
+  "input_model": "ImmutableArtifactRevision",
+  "output_model": "MemoryCandidates",
+  "required_artifact_kinds": [
+    "accepted_or_staged_chapter"
+  ],
+  "required_context_slices": [
+    "artifact_revision"
+  ],
+  "context_order": [
+    "artifact_revision"
+  ],
+  "context_budget": 5000,
+  "allowed_tool_ids": [
+    "memory.extract@1.0.0"
+  ],
+  "max_tool_calls": 1,
+  "timeout_budget": 120.0,
+  "acceptance_checks": [
+    "candidate_schema",
+    "evidence_hash_exact",
+    "m0_candidates_only"
+  ],
+  "failure_strategy": "pause",
+  "max_repairs": 0,
+  "prompt_template_path": "memory-extraction-1.0.0.txt",
+  "prompt_template_hash": "f886a7bd11d2aa07dc382e95c8d3775d73b2be11db69e4a98c9b884f71b21d08",
+  "examples_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "compatibility": {
+    "minimum_input": 1,
+    "maximum_input": 1,
+    "minimum_output": 1,
+    "maximum_output": 1
+  },
+  "audit_for": []
+}

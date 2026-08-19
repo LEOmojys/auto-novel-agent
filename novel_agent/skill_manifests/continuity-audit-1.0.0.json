@@ -1,0 +1,67 @@
+{
+  "skill_id": "continuity-audit",
+  "version": "1.0.0",
+  "status": "enabled",
+  "kind": "audit",
+  "summary": "Audit chapter continuity",
+  "owner": "ContinuityAuditor",
+  "changelog": "Initial governed release",
+  "task_types": [
+    "DRAFT_CHAPTER",
+    "CHECK_CONTINUITY"
+  ],
+  "run_states": [
+    "running"
+  ],
+  "allowed_roles": [
+    "ChapterExecutor",
+    "ContinuityAuditor"
+  ],
+  "genre_tags": [],
+  "input_model": "StagedChapter",
+  "output_model": "ContinuityReport",
+  "required_artifact_kinds": [
+    "chapter_plan",
+    "staged_chapter"
+  ],
+  "required_context_slices": [
+    "chapter_plan",
+    "m5_context",
+    "m1",
+    "m2",
+    "m3",
+    "m4"
+  ],
+  "context_order": [
+    "chapter_plan",
+    "m5_context",
+    "m1",
+    "m2",
+    "m3",
+    "m4"
+  ],
+  "context_budget": 8000,
+  "allowed_tool_ids": [
+    "continuity.audit@1.0.0"
+  ],
+  "max_tool_calls": 4,
+  "timeout_budget": 180.0,
+  "acceptance_checks": [
+    "continuity_report_schema",
+    "m0_candidates_only"
+  ],
+  "failure_strategy": "pause",
+  "max_repairs": 0,
+  "prompt_template_path": "continuity-audit-1.0.0.txt",
+  "prompt_template_hash": "8dd9bcc6d44236da6f1d50d8bff162668d1c0e14025dd63af42906fb3a530b40",
+  "examples_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "compatibility": {
+    "minimum_input": 1,
+    "maximum_input": 1,
+    "minimum_output": 1,
+    "maximum_output": 1
+  },
+  "audit_for": [
+    "chapter-scene"
+  ]
+}

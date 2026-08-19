@@ -1,0 +1,55 @@
+{
+  "skill_id": "cast-network",
+  "version": "1.0.0",
+  "status": "enabled",
+  "kind": "primary",
+  "summary": "Design the character network",
+  "owner": "CastDesigner",
+  "changelog": "Initial governed release",
+  "task_types": [
+    "PLAN_CAST"
+  ],
+  "run_states": [
+    "running"
+  ],
+  "allowed_roles": [
+    "CastDesigner"
+  ],
+  "genre_tags": [],
+  "input_model": "CharacterRequest",
+  "output_model": "CharacterSet",
+  "required_artifact_kinds": [
+    "story_brief",
+    "world_bible"
+  ],
+  "required_context_slices": [
+    "story_brief",
+    "world_bible"
+  ],
+  "context_order": [
+    "story_brief",
+    "world_bible"
+  ],
+  "context_budget": 5000,
+  "allowed_tool_ids": [
+    "character.generate@1.0.0"
+  ],
+  "max_tool_calls": 3,
+  "timeout_budget": 180.0,
+  "acceptance_checks": [
+    "character_set_schema",
+    "exact_identities_unique"
+  ],
+  "failure_strategy": "pause",
+  "max_repairs": 1,
+  "prompt_template_path": "cast-network-1.0.0.txt",
+  "prompt_template_hash": "ddfa8ca66445751c5f773b7df02362d322b638ff950449302fa338575dbc5a5b",
+  "examples_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "compatibility": {
+    "minimum_input": 1,
+    "maximum_input": 1,
+    "minimum_output": 1,
+    "maximum_output": 1
+  },
+  "audit_for": []
+}

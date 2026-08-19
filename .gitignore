@@ -14,12 +14,18 @@ __pycache__/
 venv/
 .idea/
 .vscode/
+.pytest_cache/
+
+# Local tooling indexes and scratch
+.codegraph/
+.debug-journal.md
 
 # Generated application content
 logs/
 output/
 eval_report_*.json
 data/projects/
+test-results/
 
 # Local Codex planning and evidence
 .omo/

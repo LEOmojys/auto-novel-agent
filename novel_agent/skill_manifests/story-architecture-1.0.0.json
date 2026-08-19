@@ -1,0 +1,58 @@
+{
+  "skill_id": "story-architecture",
+  "version": "1.0.0",
+  "status": "enabled",
+  "kind": "primary",
+  "summary": "Create a validated story plan",
+  "owner": "OutlinePlanner",
+  "changelog": "Initial governed release",
+  "task_types": [
+    "PLAN_OUTLINE"
+  ],
+  "run_states": [
+    "running"
+  ],
+  "allowed_roles": [
+    "OutlinePlanner"
+  ],
+  "genre_tags": [],
+  "input_model": "OutlineRequest",
+  "output_model": "PlanContract",
+  "required_artifact_kinds": [
+    "story_brief",
+    "world_bible",
+    "character_set"
+  ],
+  "required_context_slices": [
+    "story_brief",
+    "world_bible",
+    "character_set"
+  ],
+  "context_order": [
+    "story_brief",
+    "world_bible",
+    "character_set"
+  ],
+  "context_budget": 7000,
+  "allowed_tool_ids": [
+    "outline.generate@1.0.0"
+  ],
+  "max_tool_calls": 3,
+  "timeout_budget": 180.0,
+  "acceptance_checks": [
+    "plan_contract_schema",
+    "chapter_plans_present"
+  ],
+  "failure_strategy": "pause",
+  "max_repairs": 1,
+  "prompt_template_path": "story-architecture-1.0.0.txt",
+  "prompt_template_hash": "89c1e1db5598b89f0b7d94c88adf8aa628700536733e8de6c827a2e098aa590e",
+  "examples_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "compatibility": {
+    "minimum_input": 1,
+    "maximum_input": 1,
+    "minimum_output": 1,
+    "maximum_output": 1
+  },
+  "audit_for": []
+}
