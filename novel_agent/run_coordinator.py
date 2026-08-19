@@ -176,6 +176,22 @@ class RunCoordinator(RevisionCoordinatorMixin, ChapterCoordinatorMixin, Planning
             ),
         )
         self._purge_execution_traces(request.run_id)
+        # A re-run (same requirement, same run id) restarts the story from
+        # chapter 1: drop the previous cycle's accepted chapters (and the
+        # memory rows that reference them) so the written-chapter detection
+        # does not make the rebuilt graph skip chapter 1 as "already
+        # written".  REPAIR/REVISE go through control() and never touch the
+        # accepted chapters.
+        self._connection.execute(
+            "DELETE FROM memory_records WHERE source_artifact_id IN ("
+            "  SELECT artifact_id FROM artifacts WHERE run_id = ? AND kind = 'chapter' AND status = 'accepted'"
+            ")",
+            (request.run_id,),
+        )
+        self._connection.execute(
+            "DELETE FROM artifacts WHERE run_id = ? AND kind = 'chapter' AND status = 'accepted'",
+            (request.run_id,),
+        )
 
     def _purge_execution_traces(self, run_id: str) -> None:
         """Delete the previous cycle's execution traces for a requeued run.

@@ -398,3 +398,31 @@ def test_start_auto_double_submit_does_not_spawn_second_run(projects_root: Path)
     with connect_project_database(projects_root / PROJECT_ID.root) as connection:
         runs = connection.execute("SELECT run_id FROM runs ORDER BY run_id").fetchall()
         assert [str(r[0]) for r in runs] == ["novel-one-run-1"]
+
+
+def test_requeue_rerun_restarts_chapters_from_one(projects_root: Path) -> None:
+    """Re-running the same full-novel requirement must restart from chapter 1.
+
+    Regression: after a successful full_novel run, submitting the SAME
+    requirement again (requeue on the reused run id) used to rebuild the
+    graph starting at the NEXT chapter (the old accepted chapter counted as
+    "already written"), which failed with chapter_plan_missing when the new
+    outline only covered chapter 1.  The requeue now clears the previous
+    cycle's accepted chapters so the story restarts from the beginning.
+    """
+    from tests.test_chapter_approval import _TextChapterTransport
+
+    service = NovelAgentService.from_config(now=lambda: FIXED_TIME, provider_transport=_TextChapterTransport())
+    first = service.start_auto(PROJECT_ID, "写一本一章的小说")
+    assert _wait_terminal(service, first.run_id) is RunStatus.SUCCEEDED
+
+    second = service.start_auto(PROJECT_ID, "写一本一章的小说")
+    assert second.run_id == first.run_id  # same requirement -> reused run id
+    assert _wait_terminal(service, second.run_id) is RunStatus.SUCCEEDED
+
+    with connect_project_database(projects_root / PROJECT_ID.root) as connection:
+        chapters = connection.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE run_id = ? AND kind = 'chapter' AND status = 'accepted'",
+            (first.run_id,),
+        ).fetchone()
+        assert chapters[0] >= 1
