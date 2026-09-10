@@ -942,56 +942,24 @@ class _NovelNodeExecutor(NodeExecutor):
     ) -> NodeExecutionResult:
         """Persist a produced artifact as staged and pause the run for approval.
 
-        The artifact is written with a deterministic staged id (the node's
-        artifact id) but marked ``staged``/``is_current=0``; the run moves to
-        WAITING_REVIEW with an ``artifact_approval_required`` event so the
-        console can show the content and let the user approve, edit, or
-        regenerate it.  Approval persists the artifact through the normal
-        commit paths.
+        Delegates to the module-level ``stage_artifact_for_approval`` (shared
+        with the agent-loop tools); the run moves to WAITING_REVIEW with an
+        ``artifact_approval_required`` event so the console can show the
+        content and let the user approve, edit, or regenerate it.
         """
-        import hashlib as _hashlib
-
-        from novel_agent.pathing import ArtifactId
-        from novel_agent.run_event_store import append_run_event as _append_run_event
-        from novel_agent.run_state import RunEvent as _RunEvent
-
-        artifact_id = ArtifactId(
-            f"staged-{kind}-{_hashlib.sha256(f'{context.run_id}:{self._node.node_id}'.encode()).hexdigest()[:24]}"
-        )
-        timestamp = context.now()
-        connection = context.coordinator.connection
-        connection.execute(
-            "INSERT INTO artifacts(artifact_id, revision, project_id, run_id, kind, status, raw_bytes, sha256, "
-            "schema_version, is_current, created_at) VALUES (?, 1, ?, ?, ?, 'staged', ?, ?, 1, 0, ?) "
-            "ON CONFLICT(artifact_id, revision) DO UPDATE SET raw_bytes = excluded.raw_bytes, "
-            "sha256 = excluded.sha256, created_at = excluded.created_at",
-            (
-                artifact_id.root,
-                context.project_id.root,
-                context.run_id,
-                kind,
-                raw_bytes,
-                _hashlib.sha256(raw_bytes).hexdigest(),
-                timestamp.isoformat(),
-            ),
-        )
-        connection.execute(
-            "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
-            (RunStatus.WAITING_REVIEW.value, timestamp.isoformat(), context.run_id),
-        )
-        _append_run_event(
-            connection,
-            _RunEvent(
-                context.run_id,
-                "artifact_approval_required",
-                {"artifact_id": artifact_id.root, "kind": kind, "node": self._node.node_id},
-                timestamp,
-            ),
+        artifact_id = stage_artifact_for_approval(
+            connection=context.coordinator.connection,
+            project_id=context.project_id.root,
+            run_id=context.run_id,
+            kind=kind,
+            raw_bytes=raw_bytes,
+            node_id=self._node.node_id,
+            now=context.now(),
         )
         return NodeExecutionResult(
             status="blocked",
             reason="artifact_approval_required",
-            output=NodeOutput(node_id=self._node.node_id, value=artifact_id.root, committed=False),
+            output=NodeOutput(node_id=self._node.node_id, value=artifact_id, committed=False),
         )
 
     def _is_written_chapter(self, context: NodeExecutionContext, chapter_number: int) -> bool:
@@ -1483,6 +1451,65 @@ def _current_reviewer(self: _NovelNodeExecutor) -> object:
 
 def _block(context: NodeExecutionContext, reason_code: str) -> None:
     context.coordinator.block_planning(context.lease, reason_code)
+
+
+def stage_artifact_for_approval(
+    *,
+    connection,
+    project_id: str,
+    run_id: str,
+    kind: str,
+    raw_bytes: bytes,
+    node_id: str,
+    now: datetime,
+) -> str:
+    """Persist a produced artifact as staged and pause the run for approval.
+
+    Shared by the DAG node executors and the agent-loop tools: writes the
+    artifact with a deterministic staged id (sha256 of run:node) marked
+    ``staged``/``is_current=0``, moves the run to WAITING_REVIEW and emits an
+    ``artifact_approval_required`` event so the console can review/approve.
+    Returns the staged artifact id.
+    """
+    import hashlib as _hashlib
+
+    from novel_agent.pathing import ArtifactId
+    from novel_agent.run_event_store import append_run_event as _append_run_event
+    from novel_agent.run_state import RunEvent as _RunEvent
+
+    artifact_id = ArtifactId(
+        f"staged-{kind}-{_hashlib.sha256(f'{run_id}:{node_id}'.encode()).hexdigest()[:24]}"
+    )
+    timestamp = now
+    connection.execute(
+        "INSERT INTO artifacts(artifact_id, revision, project_id, run_id, kind, status, raw_bytes, sha256, "
+        "schema_version, is_current, created_at) VALUES (?, 1, ?, ?, ?, 'staged', ?, ?, 1, 0, ?) "
+        "ON CONFLICT(artifact_id, revision) DO UPDATE SET raw_bytes = excluded.raw_bytes, "
+        "sha256 = excluded.sha256, created_at = excluded.created_at",
+        (
+            artifact_id.root,
+            project_id,
+            run_id,
+            kind,
+            raw_bytes,
+            _hashlib.sha256(raw_bytes).hexdigest(),
+            timestamp.isoformat(),
+        ),
+    )
+    connection.execute(
+        "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
+        (RunStatus.WAITING_REVIEW.value, timestamp.isoformat(), run_id),
+    )
+    _append_run_event(
+        connection,
+        _RunEvent(
+            run_id,
+            "artifact_approval_required",
+            {"artifact_id": artifact_id.root, "kind": kind, "node": node_id},
+            timestamp,
+        ),
+    )
+    return artifact_id.root
 
 
 def _world_only_graph(context: NodeExecutionContext) -> bool:

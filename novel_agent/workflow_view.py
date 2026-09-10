@@ -42,6 +42,15 @@ _PLAN_NODE_ACTIVITY: dict[str, str] = {
     "outline": "规划中：章节大纲",
 }
 
+_LOOP_TOOL_LABELS: dict[str, str] = {
+    "write_world": "写世界观",
+    "write_cast": "写角色",
+    "write_outline": "写大纲",
+    "write_chapter": "写章节",
+    "review_chapter": "评审章节",
+    "mem_query": "查询设定记忆",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class WorkflowNodeView:
@@ -134,6 +143,17 @@ def _phase_and_activity(
         # phase (brief analysis / model plan generation); only show
         # "需求分析中" until the brief event exists.
         has_brief = any(event["type"] == "brief_analyzed" for event in events)
+        # Agent-loop runs never build a task graph; show its latest activity.
+        latest_loop = next(
+            (event for event in reversed(events) if event["type"] in ("tool_call", "loop_done", "loop_step")),
+            None,
+        )
+        if latest_loop is not None and has_brief:
+            if latest_loop["type"] == "loop_done":
+                return "finished", "Agent 已完成创作"
+            tool = latest_loop["payload"].get("tool", "")
+            label = _LOOP_TOOL_LABELS.get(str(tool), str(tool))
+            return "executing", f"Agent 创作中：{label}"
         if has_brief:
             return "planning", "规划中（模型正在生成执行计划）…"
         return "brief", "需求分析中…"
@@ -206,6 +226,21 @@ def _chain(events: list[dict], run_state: str | None, connection: sqlite3.Connec
                     lines.append("执行计划：已生成")
             case "task_graph_built":
                 lines.append(f"任务图已构建：{payload.get('nodes', '')}")
+            case "loop_step":
+                step = payload.get("step", "")
+                lines.append(f"◆ Agent 决策（步 {step}）")
+            case "tool_call":
+                tool = payload.get("tool", "")
+                ok = payload.get("ok", True)
+                mark = "✓" if ok else "✗"
+                label = _LOOP_TOOL_LABELS.get(str(tool), str(tool))
+                lines.append(f"{mark} 调用工具：{label}")
+            case "loop_done":
+                reply = payload.get("reply", "")
+                lines.append(f"✓ Agent 完成{('：' + str(reply)) if reply else ''}")
+            case "loop_compacted":
+                kept = payload.get("kept", 0)
+                lines.append(f"↻ 上下文已压缩（保留最近 {kept} 条）")
             case "stage_entered":
                 stage = payload.get("stage", "")
                 if stage.startswith("node_complete:"):

@@ -25,7 +25,7 @@ class StartNovelRunRequest(ServiceRequest):
     #: a start without a creative request fails fast with a clear validation
     #: error instead of degrading through the analysis pipeline.
     user_requirements: str = Field(min_length=1, max_length=100_000)
-    provider: Literal["offline_fake", "legacy_real"] | None = None
+    provider: Literal["offline_fake", "legacy_real", "agent_loop"] | None = None
     target_chapter_count: int | None = Field(default=None, ge=1, le=100)
     auto_approve: bool = True
 

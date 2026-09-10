@@ -236,6 +236,70 @@ class ContextBuilder:
         return tuple(items)
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryHit:
+    """A memory row returned by :func:`memory_query` (model-facing)."""
+
+    memory_id: str
+    subject_id: str
+    predicate: str
+    kind: str
+    content: str
+    source_artifact_id: str
+
+
+def memory_query(
+    connection: sqlite3.Connection,
+    *,
+    project_id: str,
+    query_terms: tuple[str, ...],
+    limit: int = 5,
+) -> tuple[MemoryHit, ...]:
+    """Explicit memory lookup for the agent-loop ``mem_query`` tool.
+
+    Reuses the same row loading and eligibility filtering as
+    ``ContextBuilder`` (eligibility is project-wide here, no chapter context),
+    then ranks by term matches and returns the top ``limit`` hits.
+    """
+    builder = ContextBuilder(connection)
+    rows = builder._load_rows(project_id)
+    request = ContextRequest(
+        project_id=ProjectId(project_id),
+        run_id="mem-query",
+        plan_revision=0,
+        chapter_plan_id="mem-query",
+        chapter_number=0,
+        query_terms=query_terms,
+    )
+    hits: list[MemoryHit] = []
+    for row in rows:
+        if builder._exclusion_reason(row, request) is not None:
+            continue
+        text = " ".join((row.subject_id, row.predicate, row.kind, row.content)).casefold()
+        matches = sum(text.count(term.casefold()) for term in query_terms if term)
+        if matches == 0 and not any(
+            term.casefold() in row.subject_id.casefold() for term in query_terms if term
+        ):
+            continue
+        hits.append(
+            MemoryHit(
+                memory_id=row.memory_id,
+                subject_id=row.subject_id,
+                predicate=row.predicate,
+                kind=row.kind,
+                content=row.content,
+                source_artifact_id=row.source_artifact_id or "",
+            )
+        )
+    hits.sort(key=lambda hit: _query_relevance(hit, query_terms), reverse=True)
+    return tuple(hits[:limit])
+
+
+def _query_relevance(hit: MemoryHit, query_terms: tuple[str, ...]) -> int:
+    text = " ".join((hit.subject_id, hit.predicate, hit.kind, hit.content)).casefold()
+    return sum(text.count(term.casefold()) for term in query_terms if term)
+
+
 __all__ = (
     "BudgetLedger",
     "ContextBudget",

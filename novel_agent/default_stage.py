@@ -717,6 +717,230 @@ class _LegacyStage:
 
 
 @dataclass(frozen=True, slots=True)
+class _AgentLoopStage:
+    """opencode-style model-driven loop for the novel domain.
+
+    ``provider="agent_loop"`` reuses the governed planning/chapter machinery
+    but lets the model decide, step by step, which novel tool to call next
+    (write_world / write_cast / write_outline / write_chapter / review /
+    mem_query) until it stops emitting tool calls.  Approval gates pause the
+    run into WAITING_REVIEW with the loop state persisted so REPAIR resumes
+    from the exact step, not from scratch.
+    """
+
+    coordinator: RunCoordinator
+    request: StartNovelRunRequest
+    path_resolver: ProjectPathResolver
+    now: Callable[[], datetime]
+    transport: ProviderTransport | None
+    # Optional injection for tests: a separate decision model and generator.
+    # Production uses ``transport`` for both (governed adapter as generator).
+    loop_transport: ProviderTransport | None = None
+    offline_generators: bool = False
+
+    def execute(
+        self,
+        recovery: RunRecoveryState,
+        cancellation: StageCancellationToken | None = None,
+    ) -> None:
+        if cancellation is not None and cancellation.is_cancelled():
+            return
+        from novel_agent.agent.brief import BriefAnalyzer, _INTENT_UNRECOGNIZED
+        from novel_agent.agent_loop import AgentLoop, LoopConfig
+        from novel_agent.domains.novel import NovelDomainPlugin
+        from novel_agent.loop_state import LoopState, load_loop_state, save_loop_state
+        from novel_agent.novel_tools import NovelToolContext, build_novel_loop_tools
+
+        decision_transport = self.loop_transport or self.transport or LegacyDeepSeekTransport(call=_call_deepseek)
+        catalog = load_builtin_catalog()
+        templates = load_builtin_templates(catalog)
+        memory_names_holder: dict[str, object] = {}
+        failure_sink = _failure_sink_factory(
+            self.coordinator, self.request.project_id, self.request.run_id,
+        )
+        call_event_sink = _call_event_sink_factory(self.coordinator, self.now, self.request.run_id)
+        # Decision model vs generator: offline_generators injects the
+        # deterministic offline generators so tests can script the decision
+        # transport without routing ambiguity; production uses the governed
+        # (live-model) adapter for both.
+        if self.offline_generators:
+            timestamp = self.now()
+            generator: object = OfflinePlanningGenerator(timestamp)
+            chapter_generator: object = OfflineChapterGenerator(timestamp)
+            extractor: object = OfflineMemoryExtractor(timestamp, self.request.project_id)
+            auditor: object = OfflineContinuityAuditor()
+            reviewer_holder: dict[str, object] = {"current": OfflineQualityReviewer()}
+        else:
+            generator = GovernedCreativeAdapter(
+                transport=self.transport or decision_transport,
+                now=self.now,
+                run_id=self.request.run_id,
+                project_id=self.request.project_id,
+                prompts=templates,
+                character_names_holder=memory_names_holder,
+                failure_sink=failure_sink,
+                call_event_sink=call_event_sink,
+            )
+            chapter_generator = generator
+            extractor = generator
+            auditor = OfflineContinuityAuditor()
+            reviewer_holder = {"current": OfflineQualityReviewer()}
+        existing_assets = detect_existing_assets(
+            self.path_resolver.resolve_project(self.request.project_id),
+            connection=self.coordinator.connection,
+        )
+        gateway = _build_tool_gateway(
+            self.coordinator,
+            planning_generator=generator,
+            chapter_generator=chapter_generator,
+            extractor=extractor,
+            auditor=auditor,
+            reviewer=lambda: reviewer_holder["current"],
+        )
+
+        # 1) Brief analysis (reuse the same analysis pipeline as the DAG).
+        brief_transport = self.transport or decision_transport
+        brief = BriefAnalyzer(
+            transport=brief_transport,
+            now=self.now,
+            prompt=templates.get("brief-normalization"),
+            failure_sink=failure_sink,
+            call_event_sink=call_event_sink,
+        ).analyze(
+            self.request.user_requirements,
+            project_id=self.request.project_id,
+            run_id=self.request.run_id,
+            brief_id=f"{self.request.run_id}:brief",
+            explicit_chapter_count=self.request.target_chapter_count,
+        )
+        append_run_event(
+            self.coordinator.connection,
+            RunEvent(
+                self.request.run_id,
+                "brief_analyzed",
+                {
+                    "goal": brief.goal,
+                    "domain": brief.domain,
+                    "intent": brief.intent,
+                    "degraded": brief.degraded,
+                    "degraded_reason": brief.degraded_reason or "",
+                    "constraints": ",".join(brief.constraints),
+                    "style": ",".join(brief.style_guidance),
+                    "acceptance": ",".join(brief.acceptance_criteria),
+                    "chapter_count": brief.target_chapter_count or 0,
+                },
+                self.now(),
+            ),
+        )
+        if brief.intent == _INTENT_UNRECOGNIZED and not brief.degraded:
+            self.coordinator.fail_run(recovery.lease, "intent_recognition_failed")
+            return
+
+        # 2) Load persisted loop state (approval / repair resume point).
+        prior = load_loop_state(self.coordinator.connection, self.request.run_id)
+        plan_ref = prior.plan_ref if prior is not None else None
+
+        # 3) Assemble the model-facing tools.
+        ctx = NovelToolContext(
+            plugin=NovelDomainPlugin(
+                planning_generator=generator,
+                chapter_generator=generator,
+                extractor=generator,
+                auditor=OfflineContinuityAuditor(),
+                reviewer_holder=reviewer_holder,
+                existing_assets=existing_assets,
+                auto_approve=self.request.auto_approve,
+            ),
+            coordinator=self.coordinator,
+            lease=recovery.lease,
+            brief=_story_brief_for_loop(brief),
+            existing_assets=existing_assets,
+            plan_ref=plan_ref,
+            auto_approve=self.request.auto_approve,
+            now=self.now,
+            catalog=catalog,
+            gateway=gateway,
+            path_resolver=self.path_resolver,
+        )
+        tools = build_novel_loop_tools(ctx)
+
+        # 4) Run the loop.  Events are streamed to run_events for the console.
+        def event_sink(event_type: str, payload: dict[str, object]) -> None:
+            append_run_event(
+                self.coordinator.connection,
+                RunEvent(self.request.run_id, event_type, payload, self.now()),
+            )
+
+        loop = AgentLoop(
+            tools=tools,
+            transport=decision_transport,
+            now=self.now,
+            config=LoopConfig(max_steps=40),
+            event_sink=event_sink,
+            failure_sink=lambda _caller, reason: failure_sink(
+                "agent_loop", "deepseek-v4-pro", "provider_failure", reason, ""
+            ),
+        )
+        outcome, history = loop.run(
+            system_prompt=_LOOP_SYSTEM_PROMPT.format(tools=", ".join(tools)),
+            task=self.request.user_requirements,
+            memory_snapshot=existing_assets_summary(existing_assets),
+        )
+
+        # 5) Persist the final loop state and finish.
+        state = LoopState(
+            run_id=self.request.run_id,
+            step=len(history),
+            plan_ref=ctx.plan_ref,
+            written_chapters=tuple(
+                sorted(int(n) for n in ((existing_assets or {}).get("written_chapters") or ()))
+            ),
+        )
+        save_loop_state(self.coordinator.connection, state, self.now())
+
+        if cancellation is not None and cancellation.is_cancelled():
+            return
+        if outcome == "done":
+            # Chapters were committed by the write_chapter tool; complete the
+            # run if nothing left it in a terminal state.
+            _finish_run_if_pending(self.coordinator, self.request.run_id, self.now)
+            return
+        if outcome == "step_limit":
+            self.coordinator.fail_run(recovery.lease, "agent_loop_step_limit")
+            return
+        # provider_failed: leave the run failed so REPAIR can retry.
+        self.coordinator.fail_run(recovery.lease, "agent_loop_provider_failed")
+
+
+_LOOP_SYSTEM_PROMPT = """你是小说创作 Agent。你将通过调用工具完成一部小说的创作。
+
+可用工具：{tools}
+
+工作方式：每步输出一个 JSON 动作——
+- 调用工具：{{"tool": "工具名", "args": {{...}}, "thought": "为什么做这步"}}
+- 完成：{{"done": true, "reply": "总结"}}
+
+规则：
+1. 先确保世界观、角色、大纲存在（若项目已有设定，可跳过）。
+2. 写正文用 write_chapter（指定 chapter_number）。
+3. 全部完成后输出 {{"done": true}}。不要编造工具名。"""
+
+
+def _story_brief_for_loop(brief: BriefContract):
+    from novel_agent.contracts import StoryBrief
+
+    return StoryBrief(
+        brief_id=brief.brief_id,
+        project_id=brief.project_id,
+        user_requirements=brief.raw_requirements,
+        genre="fiction",
+        target_chapter_count=brief.target_chapter_count or 10,
+        created_at=brief.created_at,
+        provenance=brief.provenance,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderSetupStage:
     coordinator: RunCoordinator
     reason_code: str = "provider_executor_not_configured"
@@ -755,6 +979,15 @@ def default_stage_executor_factory(
             request,
             path_resolver or ProjectPathResolver.from_config(),
             clock,
+        )
+    if mode == "agent_loop":
+        clock = now or (lambda: datetime.now(UTC))
+        return _AgentLoopStage(
+            coordinator,
+            request,
+            path_resolver or ProjectPathResolver.from_config(),
+            clock,
+            provider_transport,
         )
     return ProviderSetupStage(coordinator)
 

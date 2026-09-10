@@ -34,7 +34,7 @@ class StartRunExecutionPayload(RunModel):
     run_id: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
     user_requirements: str = Field(min_length=1, max_length=100_000)
-    provider: Literal["offline_fake", "legacy_real"] | None = None
+    provider: Literal["offline_fake", "legacy_real", "agent_loop"] | None = None
     target_chapter_count: int | None = Field(default=None, ge=1, le=100)
     auto_approve: bool = True
 

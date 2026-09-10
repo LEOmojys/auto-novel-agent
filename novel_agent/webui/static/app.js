@@ -410,6 +410,13 @@ const PLAN_TOOL_LABEL = {
   "character.revise@1.0.0": "角色重做",
   "outline.generate@1.0.0": "大纲生成",
   "chapter.draft@1.0.0": "章节创作",
+  // agent-loop tools
+  "write_world": "写世界观",
+  "write_cast": "写角色",
+  "write_outline": "写大纲",
+  "write_chapter": "写章节",
+  "review_chapter": "评审章节",
+  "mem_query": "查询设定记忆",
 };
 
 function loadPlanSteps(events) {
