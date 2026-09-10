@@ -29,3 +29,6 @@ test-results/
 
 # Local Codex planning and evidence
 .omo/
+
+# Personal documents (never publish)
+docs/
