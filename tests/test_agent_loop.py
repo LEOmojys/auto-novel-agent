@@ -168,9 +168,13 @@ class _LoopDecisionTransport:
 
 
 class _LoopBriefTransport:
+    def __init__(self, intent: str = "full_novel", chapter_count: int = 1) -> None:
+        self.intent = intent
+        self.chapter_count = chapter_count
+
     def generate(self, request) -> ProviderTransportResult:
-        payload = {"domain": "novel", "intent": "full_novel", "goal": "写一章小说",
-                   "constraints": [], "style_guidance": [], "acceptance_criteria": [], "chapter_count": 1}
+        payload = {"domain": "novel", "intent": self.intent, "goal": "写一章小说",
+                   "constraints": [], "style_guidance": [], "acceptance_criteria": [], "chapter_count": self.chapter_count}
         return ProviderTransportResult(content=json.dumps(payload, ensure_ascii=False), model_name="t", prompt_tokens=1, completion_tokens=1)
 
 
@@ -323,5 +327,127 @@ def test_agent_loop_approval_pause_and_resume(projects_root: Path) -> None:
             "SELECT payload_json FROM run_events WHERE run_id='run-approve' AND event_type='tool_call'"
         ).fetchall()
         assert len(tool_events) >= 1
+    finally:
+        database.__exit__(None, None, None)
+
+
+def test_agent_loop_full_approval_chain_to_success(projects_root: Path) -> None:
+    """Approval mode: approve each staged artifact in turn; loop resumes each time
+    and eventually completes with all four artifact kinds accepted."""
+    from novel_agent.default_stage import _AgentLoopStage
+    from novel_agent.pathing import ProjectPathResolver
+    from novel_agent.run_coordinator import RunCoordinator
+    from novel_agent.run_models import StartRunRequest
+    from novel_agent.run_worker import RunWorker
+    from novel_agent.service import ApproveArtifactRequest, NovelAgentService
+    from novel_agent.service_models import StartNovelRunRequest as S
+
+    database = connect_project_database(projects_root / PROJECT_ID.root)
+    connection = database.__enter__()
+    try:
+        from novel_agent.storage import migrate
+
+        migrate(connection)
+        coordinator = RunCoordinator(connection, lambda: FIXED_TIME)
+        req = S(project_id=PROJECT_ID, run_id="run-chain", idempotency_key="start-chain",
+                user_requirements="写一本一章的小说", provider="agent_loop", auto_approve=False)
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="run-chain", idempotency_key="start-chain"))
+        decision = _LoopDecisionTransport()
+        stage = _AgentLoopStage(
+            coordinator, req, ProjectPathResolver(projects_root.parent), lambda: FIXED_TIME,
+            transport=_LoopBriefTransport(), loop_transport=decision, offline_generators=True,
+        )
+        worker = RunWorker(coordinator, stage, stage_timeout_seconds=30.0)
+        svc = NovelAgentService.from_config(now=lambda: FIXED_TIME)
+
+        for round_no in range(6):
+            lease = coordinator.claim_next("worker")
+            if lease is None:
+                break
+            worker.run(lease)
+            state = connection.execute("SELECT state FROM runs WHERE run_id='run-chain'").fetchone()
+            if state == (RunStatus.SUCCEEDED.value,):
+                break
+            # Approve the latest staged artifact.
+            staged = connection.execute(
+                "SELECT artifact_id, revision FROM artifacts WHERE run_id='run-chain' AND status='staged' "
+                "ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if staged is None:
+                break
+            svc.approve_artifact(ApproveArtifactRequest(
+                project_id=PROJECT_ID, run_id="run-chain",
+                artifact_id=str(staged[0]), revision=int(staged[1]),
+                idempotency_key=f"approve-{round_no}",
+            ))
+        final = connection.execute("SELECT state FROM runs WHERE run_id='run-chain'").fetchone()
+        assert final == (RunStatus.SUCCEEDED.value,), f"chain did not finish: {final}"
+        kinds = [str(r[0]) for r in connection.execute(
+            "SELECT kind FROM artifacts WHERE run_id='run-chain' AND status='accepted' GROUP BY kind ORDER BY kind"
+        ).fetchall()]
+        assert kinds == ["chapter", "character_set", "plan_contract", "world_bible"]
+    finally:
+        database.__exit__(None, None, None)
+
+
+def test_loop_state_survives_requeue_purge(projects_root: Path) -> None:
+    """requeue/REPAIR must NOT clear loop_state (needed for breakpoint resume)."""
+    from novel_agent.loop_state import LoopState, load_loop_state, save_loop_state
+    from novel_agent.run_coordinator import RunCoordinator
+    from novel_agent.run_models import StartRunRequest
+    from novel_agent.storage import migrate
+
+    database = connect_project_database(projects_root / PROJECT_ID.root)
+    connection = database.__enter__()
+    try:
+        migrate(connection)
+        coordinator = RunCoordinator(connection, lambda: FIXED_TIME)
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="run-purge", idempotency_key="start-purge"))
+        lease = coordinator.claim_next("worker")
+        assert lease is not None
+        coordinator.fail_run(lease, "test_failure")
+        save_loop_state(
+            connection,
+            LoopState(run_id="run-purge", step=3, plan_ref=("p1", 1)),
+            FIXED_TIME,
+        )
+        # Requeue (terminal -> start) must preserve loop_state.
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="run-purge", idempotency_key="start-purge-2"))
+        assert load_loop_state(connection, "run-purge") is not None
+    finally:
+        database.__exit__(None, None, None)
+
+
+def test_agent_loop_outline_only_not_guarded_by_premature_done(projects_root: Path) -> None:
+    """An outline-only brief legitimately finishes without chapters."""
+    from novel_agent.default_stage import _AgentLoopStage
+    from novel_agent.pathing import ProjectPathResolver
+    from novel_agent.run_coordinator import RunCoordinator
+    from novel_agent.run_models import StartRunRequest
+    from novel_agent.run_worker import RunWorker
+    from novel_agent.service_models import StartNovelRunRequest as S
+
+    database = connect_project_database(projects_root / PROJECT_ID.root)
+    connection = database.__enter__()
+    try:
+        from novel_agent.storage import migrate
+
+        migrate(connection)
+        coordinator = RunCoordinator(connection, lambda: FIXED_TIME)
+        req = S(project_id=PROJECT_ID, run_id="run-outline", idempotency_key="start-outline",
+                user_requirements="写一份故事大纲", provider="agent_loop", auto_approve=True)
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="run-outline", idempotency_key="start-outline"))
+        stage = _AgentLoopStage(
+            coordinator, req, ProjectPathResolver(projects_root.parent), lambda: FIXED_TIME,
+            transport=_LoopBriefTransport(intent="outline_only"), loop_transport=_LoopDecisionTransport(), offline_generators=True,
+        )
+        worker = RunWorker(coordinator, stage, stage_timeout_seconds=30.0)
+        lease = coordinator.claim_next("worker")
+        assert lease is not None
+        worker.run(lease)
+        state = connection.execute("SELECT state FROM runs WHERE run_id='run-outline'").fetchone()
+        # outline-only should not fail with done_without_chapters even if the
+        # loop stops without writing a chapter.
+        assert state[0] in (RunStatus.SUCCEEDED.value, RunStatus.WAITING_REVIEW.value)
     finally:
         database.__exit__(None, None, None)

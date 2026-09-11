@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -738,8 +739,15 @@ class _AgentLoopStage:
     loop_transport: ProviderTransport | None = None
     offline_generators: bool = False
 
-    def _has_required_chapters(self) -> bool:
-        """Premature-done guard: brief requiring chapters must yield ≥1 accepted."""
+    def _has_required_chapters(self, brief: object) -> bool:
+        """Premature-done guard: brief requiring chapters must yield ≥1 accepted.
+
+        Only full-novel requests (chapters expected) are guarded; world-only /
+        outline-only requests legitimately finish without any chapter.
+        """
+        intent = getattr(brief, "intent", None)
+        if intent not in ("full_novel", None):
+            return True
         row = self.coordinator.connection.execute(
             "SELECT COUNT(*) FROM artifacts WHERE run_id = ? AND kind = 'chapter' AND status = 'accepted'",
             (self.request.run_id,),
@@ -934,7 +942,7 @@ class _AgentLoopStage:
             # Premature-done guard (R1.3): if the brief requires chapters but
             # none were accepted, do not finish silently — fail so REPAIR can
             # continue.
-            if not self._has_required_chapters():
+            if not self._has_required_chapters(brief):
                 self.coordinator.fail_run(recovery.lease, "agent_loop_done_without_chapters")
                 return
             # Chapters were committed by the write_chapter tool; complete the
