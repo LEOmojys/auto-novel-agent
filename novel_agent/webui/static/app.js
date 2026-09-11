@@ -13,11 +13,13 @@ const RUN_STATE_LABEL = { succeeded: "已完成", failed: "失败", running: "�
 const CHAIN_EVENTS = new Set([
   "stage_entered", "brief_analyzed", "plan_generated", "task_graph_built",
   "chapter_staged", "chapter_accepted", "provider_call_started", "provider_call_finished",
+  "loop_plan",
 ]);
 const EVENT_LABEL = {
   stage_entered: "进入阶段", brief_analyzed: "需求分析完成", plan_generated: "规划已生成",
   task_graph_built: "任务图已构建", chapter_staged: "章节待确认", chapter_accepted: "章节已确认",
   provider_call_started: "调用模型", provider_call_finished: "模型调用完成",
+  loop_plan: "Agent 执行计划",
 };
 
 function nodePhase(nodeId) {

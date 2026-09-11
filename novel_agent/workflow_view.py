@@ -145,12 +145,16 @@ def _phase_and_activity(
         has_brief = any(event["type"] == "brief_analyzed" for event in events)
         # Agent-loop runs never build a task graph; show its latest activity.
         latest_loop = next(
-            (event for event in reversed(events) if event["type"] in ("tool_call", "loop_done", "loop_step")),
+            (event for event in reversed(events) if event["type"] in ("tool_call", "loop_done", "loop_step", "loop_plan")),
             None,
         )
         if latest_loop is not None and has_brief:
             if latest_loop["type"] == "loop_done":
                 return "finished", "Agent 已完成创作"
+            if latest_loop["type"] == "loop_plan":
+                steps = str(latest_loop["payload"].get("steps", ""))
+                labels = "，".join(_LOOP_TOOL_LABELS.get(part, part) for part in steps.split(";") if part)
+                return "executing", f"Agent 创作中：已规划 {labels}"
             tool = latest_loop["payload"].get("tool", "")
             label = _LOOP_TOOL_LABELS.get(str(tool), str(tool))
             return "executing", f"Agent 创作中：{label}"
@@ -229,6 +233,12 @@ def _chain(events: list[dict], run_state: str | None, connection: sqlite3.Connec
             case "loop_step":
                 step = payload.get("step", "")
                 lines.append(f"◆ Agent 决策（步 {step}）")
+            case "loop_plan":
+                steps = str(payload.get("steps", ""))
+                labels = " → ".join(
+                    _LOOP_TOOL_LABELS.get(part, part) for part in steps.split(";") if part
+                )
+                lines.append(f"执行计划（Agent 规划）：{labels}")
             case "tool_call":
                 tool = payload.get("tool", "")
                 ok = payload.get("ok", True)

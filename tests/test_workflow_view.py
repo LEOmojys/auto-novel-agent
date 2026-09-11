@@ -135,3 +135,19 @@ def test_brief_phase_before_graph(tmp_path: Path) -> None:
 
     assert view.phase == "brief"
     assert view.nodes == ()
+
+
+def test_agent_loop_plan_chain_and_activity(tmp_path: Path) -> None:
+    project_path = tmp_path / "p6"
+    with connect_project_database(project_path) as connection:
+        migrate(connection)
+        _run(connection)
+        _event(connection, "brief_analyzed", {"goal": "写小说", "intent": "full_novel", "chapter_count": 2})
+        _event(connection, "loop_step", {"step": 0})
+        _event(connection, "loop_plan", {"steps": "write_outline;write_chapter"})
+
+        view = build_workflow_view(connection, RUN_ID)
+
+    assert any("执行计划（Agent 规划）" in line and "写大纲" in line and "写章节" in line for line in view.chain)
+    assert view.phase == "executing"
+    assert view.current_activity == "Agent 创作中：已规划 写大纲，写章节"

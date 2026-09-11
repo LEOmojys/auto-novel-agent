@@ -956,18 +956,25 @@ class _AgentLoopStage:
         self.coordinator.fail_run(recovery.lease, "agent_loop_provider_failed")
 
 
-_LOOP_SYSTEM_PROMPT = """你是小说创作 Agent。你将通过调用工具完成一部小说的创作。
+_LOOP_SYSTEM_PROMPT = """你是小说创作 Agent，工作范式为 Plan-Act：先规划，再按计划依次执行。
 
 可用工具：{tools}
 
-工作方式：每步输出一个 JSON 动作——
-- 调用工具：{{"tool": "工具名", "args": {{...}}, "thought": "为什么做这步"}}
-- 完成：{{"done": true, "reply": "总结"}}
+工作方式：
+1. 规划：先分析用户需求与已有设定，首轮输出执行计划（按依赖顺序，已有内容不要重复生成）：
+   {{"plan": [{{"tool": "write_chapter", "args": {{"chapter_number": 1}}}}], "thought": "为什么这样安排"}}
+   系统会立即执行计划的第一步，并把每一步的结果反馈给你。
+2. 执行：每一步之后你决定：
+   - 继续计划下一步：{{"next": true}}
+   - 调整计划：输出新的 plan 覆盖剩余步骤，或直接调用工具 {{"tool": "工具名", "args": {{...}}}}
+   - 任务完成：{{"done": true, "reply": "总结"}}
 
 规则：
-1. 先确保世界观、角色、大纲存在（若项目已有设定，可跳过）。
-2. 写正文用 write_chapter（指定 chapter_number）。
-3. 全部完成后输出 {{"done": true}}。不要编造工具名。"""
+1. 依赖顺序：世界观 → 角色 → 大纲 → 章节；写章节前必须已有对应大纲。
+2. 已有设定（世界观/角色/大纲/已写章节）不要重复生成；续写时只规划缺失的章节。
+3. write_chapter 需要 chapter_number；"续写下一章"从已写章节的下一章开始。
+4. 严格使用可用工具名，不要编造工具。
+5. 首轮必须先输出 plan，不要直接调用工具；计划执行完后确认任务完成再输出 {{"done": true}}。"""
 
 
 def _story_brief_for_loop(brief: BriefContract):

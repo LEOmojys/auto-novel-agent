@@ -87,7 +87,11 @@ def test_loop_runs_until_done() -> None:
     }
     loop = AgentLoop(
         tools=tools,
-        transport=_SeqTransport(['{"tool": "a", "args": {}}', '{"tool": "b", "args": {}}', '{"done": true}']),
+        transport=_SeqTransport([
+            '{"plan": [{"tool": "a", "args": {}}, {"tool": "b", "args": {}}]}',
+            '{"next": true}',
+            '{"done": true}',
+        ]),
         now=lambda: FIXED_TIME,
         config=LoopConfig(max_steps=10),
     )
@@ -95,12 +99,13 @@ def test_loop_runs_until_done() -> None:
     assert outcome == "done"
     assert called == ["a", "b"]
     assert any(m.role == "tool" for m in history)
+    assert any("执行计划" in m.content for m in history)
 
 
 def test_loop_hits_step_limit() -> None:
     loop = AgentLoop(
         tools={"a": _recorder_tool("a", [])},
-        transport=_SeqTransport(['{"tool": "a", "args": {}}'] * 10),
+        transport=_SeqTransport(['{"plan": [{"tool": "a", "args": {}}]}'] * 10),
         now=lambda: FIXED_TIME,
         config=LoopConfig(max_steps=3),
     )
@@ -110,19 +115,22 @@ def test_loop_hits_step_limit() -> None:
 
 def test_loop_doom_detection_breaks_identical_repeats() -> None:
     called: list[str] = []
+    events: list[tuple[str, dict]] = []
     loop = AgentLoop(
         tools={"a": _recorder_tool("a", called)},
-        transport=_SeqTransport(['{"tool": "a", "args": {"x": 1}}'] * 10),
+        transport=_SeqTransport(['{"plan": [{"tool": "a", "args": {"x": 1}}]}'] * 10),
         now=lambda: FIXED_TIME,
         config=LoopConfig(max_steps=20, doom_loop_threshold=3),
+        event_sink=lambda event_type, payload: events.append((event_type, payload)),
     )
-    outcome, history = loop.run(system_prompt="sys", task="任务")
-    # doom detection injects a warning and stops calling the same tool; the
-    # scripted transport then keeps returning 'a' but the loop must eventually
+    outcome, _history = loop.run(system_prompt="sys", task="任务")
+    # doom detection flags the repeated (tool, args) and stops executing it;
+    # the scripted transport keeps re-planning the same step but the loop must
     # terminate (step limit) rather than spin forever with the same args.
     assert outcome == "step_limit"
-    # After the first 3 identical calls the 4th+ should have been suppressed.
-    assert called.count("a") <= 3 + 1
+    # The identical call was suppressed once the threshold was reached.
+    assert called.count("a") <= 3
+    assert any(event_type == "loop_doom_detected" for event_type, _payload in events)
 
 
 def test_loop_recovers_from_parse_failure() -> None:
@@ -137,6 +145,77 @@ def test_loop_recovers_from_parse_failure() -> None:
     assert any("无法解析" in m.content for m in history)
 
 
+def test_parse_action_plan_and_next() -> None:
+    action = parse_action('{"plan": [{"tool": "a", "args": {}}, {"tool": "b", "args": {"x": 1}}]}')
+    assert action is not None and action.kind == "plan"
+    assert action.plan == (("a", {}), ("b", {"x": 1}))
+    nxt = parse_action('{"next": true}')
+    assert nxt is not None and nxt.kind == "next"
+
+
+def test_loop_requires_plan_before_first_tool() -> None:
+    called: list[str] = []
+    loop = AgentLoop(
+        tools={"a": _recorder_tool("a", called)},
+        transport=_SeqTransport(['{"tool": "a", "args": {}}', '{"done": true}']),
+        now=lambda: FIXED_TIME,
+        config=LoopConfig(max_steps=10),
+    )
+    outcome, history = loop.run(system_prompt="sys", task="任务")
+    assert outcome == "done"
+    assert called == []
+    assert any("请先输出执行计划" in m.content for m in history)
+
+
+def test_loop_emits_plan_event_and_executes_first_step() -> None:
+    called: list[str] = []
+    events: list[tuple[str, dict]] = []
+    loop = AgentLoop(
+        tools={"a": _recorder_tool("a", called)},
+        transport=_SeqTransport(['{"plan": [{"tool": "a", "args": {}}]}', '{"done": true}']),
+        now=lambda: FIXED_TIME,
+        config=LoopConfig(max_steps=10),
+        event_sink=lambda event_type, payload: events.append((event_type, payload)),
+    )
+    outcome, _history = loop.run(system_prompt="sys", task="任务")
+    assert outcome == "done"
+    assert called == ["a"]
+    assert ("loop_plan", {"steps": "a"}) in events
+
+
+def test_loop_plan_replacement_skips_replaced_steps() -> None:
+    called: list[str] = []
+    tools = {name: _recorder_tool(name, called) for name in ("a", "b", "c")}
+    loop = AgentLoop(
+        tools=tools,
+        transport=_SeqTransport([
+            '{"plan": [{"tool": "a", "args": {}}, {"tool": "b", "args": {}}]}',
+            '{"plan": [{"tool": "c", "args": {}}]}',
+            '{"done": true}',
+        ]),
+        now=lambda: FIXED_TIME,
+        config=LoopConfig(max_steps=10),
+    )
+    outcome, _history = loop.run(system_prompt="sys", task="任务")
+    assert outcome == "done"
+    # The replacement plan drops the remaining "b" step; "c" runs instead.
+    assert called == ["a", "c"]
+
+
+def test_loop_next_without_plan_guides_model() -> None:
+    called: list[str] = []
+    loop = AgentLoop(
+        tools={"a": _recorder_tool("a", called)},
+        transport=_SeqTransport(['{"next": true}', '{"done": true}']),
+        now=lambda: FIXED_TIME,
+        config=LoopConfig(max_steps=10),
+    )
+    outcome, history = loop.run(system_prompt="sys", task="任务")
+    assert outcome == "done"
+    assert called == []
+    assert any("已全部执行完" in m.content for m in history)
+
+
 # -- novel_tools governance ---------------------------------------------------
 
 
@@ -149,14 +228,16 @@ def projects_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 class _LoopDecisionTransport:
-    """Scripted decision model: world -> cast -> outline -> chapter -> done."""
+    """Scripted Plan-Act model: plan (world..chapter) -> re-plan remaining -> done."""
 
     def __init__(self) -> None:
         self.actions = [
-            '{"tool": "write_world", "args": {}}',
-            '{"tool": "write_cast", "args": {}}',
-            '{"tool": "write_outline", "args": {}}',
-            '{"tool": "write_chapter", "args": {"chapter_number": 1}}',
+            '{"plan": [{"tool": "write_world", "args": {}}, {"tool": "write_cast", "args": {}}, '
+            '{"tool": "write_outline", "args": {}}, {"tool": "write_chapter", "args": {"chapter_number": 1}}]}',
+            '{"plan": [{"tool": "write_cast", "args": {}}, {"tool": "write_outline", "args": {}}, '
+            '{"tool": "write_chapter", "args": {"chapter_number": 1}}]}',
+            '{"plan": [{"tool": "write_outline", "args": {}}, {"tool": "write_chapter", "args": {"chapter_number": 1}}]}',
+            '{"plan": [{"tool": "write_chapter", "args": {"chapter_number": 1}}]}',
             '{"done": true, "reply": "完成"}',
         ]
         self.calls = 0
