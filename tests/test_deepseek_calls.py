@@ -116,3 +116,58 @@ def test_missing_key_raises_typed_runtime_error(monkeypatch: pytest.MonkeyPatch)
 
     with pytest.raises(RuntimeError, match="未找到 LLM API Key"):
         access_deepseek("hi", max_retry=1)
+
+
+def test_responses_api_style_builds_url_and_parses_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LLM_API_STYLE=responses → POST {base}/responses, body uses input, parses output[].content[].text."""
+    from tools_call_deepseek import access_deepseek
+
+    monkeypatch.setenv("LLM_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
+    monkeypatch.setenv("LLM_API_KEY", "ark-test")
+    monkeypatch.setenv("LLM_MODEL", "glm-4.7")
+    monkeypatch.setenv("LLM_FALLBACK_MODEL", "glm-4.7")
+    monkeypatch.setenv("LLM_API_STYLE", "responses")
+
+    captured: list[dict] = []
+    payload = {
+        "output": [
+            {"type": "message", "content": [{"type": "output_text", "text": "火山回复"}]}
+        ],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 4},
+    }
+
+    def fake_post(url, headers=None, data=None, timeout=None):
+        captured.append({"url": url, "body": json.loads(data), "auth": headers.get("Authorization")})
+        return _FakeResponse(200, payload)
+
+    monkeypatch.setattr("tools_call_deepseek.requests.post", fake_post)
+
+    result = access_deepseek("你好", max_retry=1)
+
+    assert result == "火山回复"
+    assert captured[0]["url"] == "https://ark.cn-beijing.volces.com/api/coding/v3/responses"
+    assert captured[0]["body"]["model"] == "glm-4.7"
+    assert captured[0]["body"]["input"] == [{"role": "user", "content": "你好"}]
+    assert "max_output_tokens" in captured[0]["body"]
+    assert captured[0]["auth"] == "Bearer ark-test"
+
+
+def test_chat_style_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default (no LLM_API_STYLE) still uses chat completions."""
+    from tools_call_deepseek import access_deepseek
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.delenv("LLM_API_STYLE", raising=False)
+    captured: list[dict] = []
+
+    def fake_post(url, headers=None, data=None, timeout=None):
+        captured.append({"url": url, "body": json.loads(data)})
+        return _FakeResponse(200, {"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    monkeypatch.setattr("tools_call_deepseek.requests.post", fake_post)
+
+    result = access_deepseek("你好", max_retry=1)
+
+    assert result == "ok"
+    assert captured[0]["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert "messages" in captured[0]["body"]

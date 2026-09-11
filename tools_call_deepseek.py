@@ -27,8 +27,22 @@ FALLBACK_MODEL = "deepseek-v4-flash"
 
 
 def get_base_url() -> str:
-    """Resolve the OpenAI-compatible base URL (``LLM_BASE_URL`` overrides)."""
+    """Resolve the OpenAI-compatible base URL (``LLM_BASE_URL`` overrides).
+
+    The value may be a full endpoint (DeepSeek default, already ends in
+    ``/chat/completions``) or a base URL (e.g. Volcano Ark Coding Plan
+    ``https://ark.cn-beijing.volces.com/api/coding/v3``) to which
+    ``/chat/completions`` is appended at call time.
+    """
     return os.environ.get("LLM_BASE_URL", "").strip() or API_URL
+
+
+def _chat_completions_url(base_url: str) -> str:
+    """Normalize a base URL into the full chat-completions endpoint."""
+    stripped = base_url.rstrip("/")
+    if stripped.endswith("/chat/completions"):
+        return stripped
+    return f"{stripped}/chat/completions"
 
 
 def get_model_name() -> str:
@@ -39,6 +53,17 @@ def get_model_name() -> str:
 def get_fallback_model() -> str:
     """Resolve the fallback model name (``LLM_FALLBACK_MODEL`` overrides)."""
     return os.environ.get("LLM_FALLBACK_MODEL", "").strip() or FALLBACK_MODEL
+
+
+def get_api_style() -> str:
+    """Resolve the API protocol style (``LLM_API_STYLE`` overrides).
+
+    ``chat`` (default) uses the OpenAI chat-completions endpoint; ``responses``
+    uses the Responses API (``POST {base}/responses``), which is what Volcano
+    Ark Coding Plan exposes.
+    """
+    style = os.environ.get("LLM_API_STYLE", "").strip().lower()
+    return style if style in ("chat", "responses") else "chat"
 
 
 # Official output limit field is ``max_tokens``; without it long Chinese
@@ -105,21 +130,73 @@ def _log_tokens(model: str, prompt_tokens: int, completion_tokens: int, caller: 
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _build_request(style: str, base_url: str, model: str, text: str) -> tuple[str, dict]:
+    """Build (url, body) for the configured API style."""
+    if style == "responses":
+        url = f"{base_url.rstrip('/')}/responses"
+        body = {
+            "model": model,
+            "input": [{"role": "user", "content": text}],
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+        }
+        return url, body
+    url = _chat_completions_url(base_url)
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": text}],
+        "temperature": 0.7,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+    }
+    return url, body
+
+
+def _parse_response(style: str, response_json: dict, model: str, caller_label: str) -> tuple[str, dict]:
+    """Extract (text, usage) from a chat-completions or Responses payload."""
+    if style == "responses":
+        output = response_json.get("output") or []
+        text_parts: list[str] = []
+        for item in output:
+            if isinstance(item, dict) and item.get("type") == "message":
+                for part in item.get("content") or []:
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        text_parts.append(str(part.get("text", "")))
+        response_txt = "".join(text_parts)
+    else:
+        response_txt = response_json["choices"][0]["message"]["content"]
+    usage = response_json.get("usage", {})
+    prompt_tokens = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    total = prompt_tokens + completion_tokens
+
+    _log_tokens(model, prompt_tokens, completion_tokens, caller_label)
+
+    token_info = {
+        "model": model,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total,
+    }
+    return response_txt, token_info
+
+
 def access_deepseek(text, max_retry=3, model_name=None,
                     return_tokens=False, caller=""):
-    """Call the configured OpenAI-compatible chat completions API.
+    """Call the configured OpenAI-compatible API (chat-completions or Responses).
 
-    Endpoint, API key and model names are read from the environment at call
-    time (``LLM_BASE_URL`` / ``LLM_API_KEY`` / ``LLM_MODEL`` / ``LLM_FALLBACK_MODEL``;
-    DeepSeek defaults when unset), so the same code serves DeepSeek, Volcano
-    Ark Coding Plan, or any compatible gateway without code changes.
+    Endpoint, API key, model names and protocol style are read from the
+    environment at call time (``LLM_BASE_URL`` / ``LLM_API_KEY`` /
+    ``LLM_MODEL`` / ``LLM_FALLBACK_MODEL`` / ``LLM_API_STYLE``; DeepSeek chat
+    defaults when unset).  ``LLM_API_STYLE=responses`` selects the Responses
+    API (``POST {base}/responses``) used by Volcano Ark Coding Plan.
 
-    - ``max_tokens`` is always sent so long outputs are not truncated.
+    - ``max_tokens`` / ``max_output_tokens`` is always sent so long outputs
+      are not truncated.
     - Non-retryable HTTP codes (401/402/403/400/422) fail immediately with the
       status exposed; only 429/5xx/transport errors retry with backoff.
     - A model failure falls back to the configured fallback model.
     """
     base_url = get_base_url()
+    style = get_api_style()
     primary_model = model_name or get_model_name()
     fallback_models = [get_fallback_model()]
     if primary_model not in fallback_models:
@@ -136,17 +213,10 @@ def access_deepseek(text, max_retry=3, model_name=None,
                     "Authorization": f"Bearer {apikey}",
                     "Content-Type": "application/json",
                 }
-                data = {
-                    "model": model,
-                    "messages": [
-                        {"role": "user", "content": text}
-                    ],
-                    "temperature": 0.7,
-                    "max_tokens": MAX_OUTPUT_TOKENS,
-                }
+                url, data = _build_request(style, base_url, model, text)
 
                 response = requests.post(
-                    base_url,
+                    url,
                     headers=headers,
                     data=json.dumps(data),
                     timeout=300,
@@ -159,21 +229,7 @@ def access_deepseek(text, max_retry=3, model_name=None,
                 response.raise_for_status()
 
                 response_json = response.json()
-                response_txt = response_json["choices"][0]["message"]["content"]
-
-                usage = response_json.get("usage", {})
-                prompt_tokens = usage.get("prompt_tokens", 0)
-                completion_tokens = usage.get("completion_tokens", 0)
-                total = prompt_tokens + completion_tokens
-
-                _log_tokens(model, prompt_tokens, completion_tokens, caller_label)
-
-                token_info = {
-                    "model": model,
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total,
-                }
+                response_txt, token_info = _parse_response(style, response_json, model, caller_label)
 
                 if return_tokens:
                     return response_txt, token_info
