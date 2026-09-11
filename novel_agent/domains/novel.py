@@ -1143,8 +1143,17 @@ class _NovelNodeExecutor(NodeExecutor):
             None,
         )
         if chapter is None:
-            _block(context, "chapter_plan_missing")
-            return NodeExecutionResult(status="blocked", reason="chapter_plan_missing")
+            # The derived next chapter exceeds the current outline: the run is
+            # reusing an outline that does not cover it (e.g. a placeholder
+            # plan became is_current).  Report the mismatch clearly.
+            _block(
+                context,
+                f"chapter_plan_missing:{chapter_number}:outline_has_{len(plan.chapters)}_chapters",
+            )
+            return NodeExecutionResult(
+                status="blocked",
+                reason=f"chapter_plan_missing:{chapter_number}:outline_has_{len(plan.chapters)}_chapters",
+            )
         force_rewrite = dict(self._node.metadata).get("force_rewrite") == "1"
         if not force_rewrite and reused_outline and self._is_written_chapter(context, chapter_number):
             # Already produced under the reused outline: skip, do not rewrite.
