@@ -1287,11 +1287,19 @@ def _merge_sqlite_outline(assets: dict[str, object], connection) -> None:
     import json as json_module
 
     try:
-        row = connection.execute(
-            "SELECT raw_bytes, revision FROM artifacts "
+        # Prefer the is_current outline with the MOST chapters.  Placeholder
+        # plans from offline/test runs can carry is_current=1 while a real
+        # multi-chapter outline exists; choosing the largest one keeps the
+        # canonical story outline from being shadowed by a 1-chapter stub.
+        rows = connection.execute(
+            "SELECT raw_bytes, revision, "
+            "  CASE WHEN json_array_length(json_extract(raw_bytes, '$.chapters')) IS NULL THEN 0 "
+            "       ELSE json_array_length(json_extract(raw_bytes, '$.chapters')) END AS n_chapters "
+            "FROM artifacts "
             "WHERE kind = 'plan_contract' AND status = 'accepted' AND is_current = 1 "
-            "ORDER BY created_at DESC, revision DESC LIMIT 1"
-        ).fetchone()
+            "ORDER BY n_chapters DESC, created_at DESC, revision DESC"
+        ).fetchall()
+        row = rows[0] if rows else None
     except Exception:  # noqa: BROAD_EXCEPT_OK - reuse is best-effort
         return
     if row is None:
