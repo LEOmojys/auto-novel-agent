@@ -22,6 +22,8 @@
     <div class="topbar-fields">
       <label class="field-label" for="project-select">项目</label>
       <select id="project-select" title="项目"></select>
+      <input id="new-project" class="new-project" placeholder="新建项目名…" title="输入项目名后回车或点创建">
+      <button id="create-project-btn" class="create-project" title="创建新项目">创建</button>
 
       <span id="llm-status" class="llm-status" title="启动时自动检查 LLM API 连通性">LLM API: 检查中…</span>
     </div>
@@ -48,6 +50,7 @@
         <select id="provider-select">
           <option value="offline_fake">offline_fake（演示）</option>
           <option value="legacy_real">legacy_real（真实模型）</option>
+          <option value="agent_loop">agent_loop（模型自决循环）</option>
         </select>
       </div>
 

@@ -217,3 +217,26 @@ def test_start_requires_non_blank_requirements() -> None:
         user_requirements="  写一本小说  ",
     )
     assert request.user_requirements == "写一本小说"
+
+
+def test_create_project_endpoint(console: _Client) -> None:
+    """POST /api/projects/create adds a project and returns the refreshed list."""
+    status, data = console.post("/api/projects/create", {"name": "brand-new-project"})
+    assert status == 200
+    assert data.get("project") == "brand-new-project"
+    assert "brand-new-project" in data.get("projects", [])
+
+
+def test_create_project_rejects_bad_name(console: _Client) -> None:
+    status, data = console.post("/api/projects/create", {"name": "../escape"})
+    assert status == 200  # handled as an error payload, not a crash
+    assert "error" in data
+    assert data["error"]
+
+
+def test_provider_select_includes_agent_loop() -> None:
+    from novel_agent.webui import server as server_module
+
+    html = (server_module._STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+    assert 'value="agent_loop"' in html
+    assert 'value="legacy_real"' in html

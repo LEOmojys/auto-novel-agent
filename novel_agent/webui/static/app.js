@@ -93,6 +93,34 @@ function summarizePayload(payload) {
 
 // ---------- 初始化 ----------
 
+async function createProject() {
+  const name = $("new-project").value.trim();
+  if (!name) {
+    setBadge("err", "请输入新项目名");
+    return;
+  }
+  try {
+    const data = await post("/api/projects/create", { name });
+    if (data.error) throw new Error(data.error);
+    $("new-project").value = "";
+    // Refresh the project list and select the new project.
+    const select = $("project-select");
+    select.innerHTML = "";
+    for (const project of data.projects) {
+      const option = document.createElement("option");
+      option.value = project;
+      option.textContent = project;
+      select.appendChild(option);
+      if (project === data.project) select.value = project;
+    }
+    state.project = data.project;
+    setBadge("ok", `已创建项目：${data.project}`);
+    await loadHistory();
+  } catch (error) {
+    setBadge("err", error.message);
+  }
+}
+
 async function loadProjects() {
   const data = await api("/api/projects");
   const select = $("project-select");
@@ -750,6 +778,13 @@ async function checkProvider() {
 // ---------- 事件绑定 ----------
 
 $("start-btn").addEventListener("click", startRun);
+$("create-project-btn").addEventListener("click", createProject);
+$("new-project").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    createProject();
+  }
+});
 $("pause-btn").addEventListener("click", () => control("pause"));
 $("resume-btn").addEventListener("click", () => control("resume"));
 $("cancel-btn").addEventListener("click", () => control("cancel"));

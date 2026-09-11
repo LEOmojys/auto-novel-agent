@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Final
 from urllib.parse import parse_qs, unquote, urlparse
 
+from pydantic import ValidationError
+
 from novel_agent.contracts import RunCommandType
 from novel_agent.pathing import ProjectId
 from novel_agent.service import (
@@ -147,6 +149,8 @@ class AgentConsoleHandler(BaseHTTPRequestHandler):
 
     def _route_post(self, url: urlparse) -> None:
         body = self._body()
+        if url.path == "/api/projects/create":
+            return self._json(self._create_project_payload(body))
         if url.path == "/api/run/start":
             return self._json(self._start_payload(body))
         if url.path == "/api/run/control":
@@ -383,6 +387,17 @@ class AgentConsoleHandler(BaseHTTPRequestHandler):
             idempotency_key=f"webui-plan-regenerate:{body['run_id']}",
         )
         return _snapshot_dict(snapshot)
+
+    def _create_project_payload(self, body: dict) -> dict:
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return {"error": "项目名不能为空"}
+        try:
+            project_id = self.server.service.create_project(name)
+        except ValidationError as error:
+            return {"error": f"项目名不合法：{error}"}
+        projects = [p.root for p in self.server.service.project_ids()]
+        return {"project": project_id.root, "projects": projects}
 
     def _start_payload(self, body: dict) -> dict:
         run_id = str(body["run_id"]).strip() if body.get("run_id") else ""

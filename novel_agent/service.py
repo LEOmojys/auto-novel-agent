@@ -114,6 +114,20 @@ class NovelAgentService:
         default = ProjectId(config.DEFAULT_PROJECT)
         return tuple(sorted(set(project_ids + [default]), key=lambda item: item.root))
 
+    def create_project(self, name: str) -> ProjectId:
+        """Create a new project directory (idempotent) and return its id.
+
+        The name goes through the same ``ProjectId`` validation as the rest of
+        the system (rejects traversal / Windows-invalid characters), so a new
+        project is always a safe, contained directory under the projects root.
+        """
+        project_id = ProjectId(name)
+        root = self._path_resolver.resolve_project(project_id)
+        root.mkdir(parents=True, exist_ok=True)
+        with self._connection(project_id):
+            pass  # creates + migrates the project database
+        return project_id
+
     def start(self, request: StartNovelRunRequest) -> RunUiSnapshot:
         requirement_sha256 = hashlib.sha256(request.user_requirements.encode()).hexdigest()
         with self._connection(request.project_id) as connection:
