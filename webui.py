@@ -4,16 +4,21 @@
 Usage:
     python webui.py                # http://127.0.0.1:7860
     python webui.py --port 8000
+
+A local ``.env`` file in the project root is loaded on startup (keys already
+present in the environment win).
 """
 
 from __future__ import annotations
 
 import argparse
 
+from novel_agent.env import load_env
 from novel_agent.webui.server import launch_console
 
 
 def main() -> None:
+    load_env()
     parser = argparse.ArgumentParser(description="Novel Agent web console")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
