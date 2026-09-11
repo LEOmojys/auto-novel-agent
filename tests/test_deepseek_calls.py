@@ -112,6 +112,7 @@ def test_pro_model_failure_falls_back_to_flash(monkeypatch: pytest.MonkeyPatch) 
 def test_missing_key_raises_typed_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY_1", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
 
-    with pytest.raises(RuntimeError, match="未找到 DeepSeek API Key"):
+    with pytest.raises(RuntimeError, match="未找到 LLM API Key"):
         access_deepseek("hi", max_retry=1)

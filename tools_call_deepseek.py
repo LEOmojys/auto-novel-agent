@@ -13,9 +13,33 @@ _LOG_LOCK = threading.Lock()
 
 # DeepSeek V4 (2026): official models and OpenAI-compatible endpoint.
 # base_url https://api.deepseek.com (``/v1`` is an official alias).
+#
+# All of these can be overridden via environment variables (loaded from the
+# local ``.env`` by ``novel_agent.env.load_env``), so any OpenAI-compatible
+# endpoint can be used — e.g. Volcano Ark Coding Plan:
+#   LLM_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
+#   LLM_API_KEY=ark-...
+#   LLM_MODEL=<volcano model id>
+#   LLM_FALLBACK_MODEL=<volcano fallback model id>
 API_URL = "https://api.deepseek.com/v1/chat/completions"
 DEFAULT_MODEL = "deepseek-v4-pro"
 FALLBACK_MODEL = "deepseek-v4-flash"
+
+
+def get_base_url() -> str:
+    """Resolve the OpenAI-compatible base URL (``LLM_BASE_URL`` overrides)."""
+    return os.environ.get("LLM_BASE_URL", "").strip() or API_URL
+
+
+def get_model_name() -> str:
+    """Resolve the primary model name (``LLM_MODEL`` overrides)."""
+    return os.environ.get("LLM_MODEL", "").strip() or DEFAULT_MODEL
+
+
+def get_fallback_model() -> str:
+    """Resolve the fallback model name (``LLM_FALLBACK_MODEL`` overrides)."""
+    return os.environ.get("LLM_FALLBACK_MODEL", "").strip() or FALLBACK_MODEL
+
 
 # Official output limit field is ``max_tokens``; without it long Chinese
 # chapters (3000+ chars) can be truncated by the default output cap.
@@ -46,20 +70,23 @@ def _get_api_key():
 
     Read live from ``os.environ`` (never a module-import snapshot) so keys
     set after startup — e.g. by the web console or a test — take effect
-    immediately.  ``DEEPSEEK_API_KEY_1`` is the primary slot and
-    ``DEEPSEEK_API_KEY`` the fallback.
+    immediately.  ``LLM_API_KEY`` is the generic slot (works with any
+    OpenAI-compatible endpoint such as Volcano Ark); ``DEEPSEEK_API_KEY_1``
+    and ``DEEPSEEK_API_KEY`` are kept for backward compatibility.
     """
     keys = []
+    generic = os.environ.get("LLM_API_KEY", "").strip()
+    if generic:
+        keys.append(generic)
     primary = os.environ.get("DEEPSEEK_API_KEY_1", "").strip()
-    if primary:
+    if primary and primary not in keys:
         keys.append(primary)
     fallback = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if fallback and fallback not in keys:
         keys.append(fallback)
     if not keys:
         raise RuntimeError(
-            "未找到 DeepSeek API Key。请设置环境变量 DEEPSEEK_API_KEY "
-            "或 DEEPSEEK_API_KEY_1"
+            "未找到 LLM API Key。请设置环境变量 LLM_API_KEY（或 DEEPSEEK_API_KEY / DEEPSEEK_API_KEY_1）"
         )
     return keys[hash(str(time.time())) % len(keys)]
 
@@ -78,18 +105,25 @@ def _log_tokens(model: str, prompt_tokens: int, completion_tokens: int, caller: 
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def access_deepseek(text, max_retry=3, model_name=DEFAULT_MODEL,
+def access_deepseek(text, max_retry=3, model_name=None,
                     return_tokens=False, caller=""):
-    """Call the DeepSeek V4 chat completions API with governed retry semantics.
+    """Call the configured OpenAI-compatible chat completions API.
+
+    Endpoint, API key and model names are read from the environment at call
+    time (``LLM_BASE_URL`` / ``LLM_API_KEY`` / ``LLM_MODEL`` / ``LLM_FALLBACK_MODEL``;
+    DeepSeek defaults when unset), so the same code serves DeepSeek, Volcano
+    Ark Coding Plan, or any compatible gateway without code changes.
 
     - ``max_tokens`` is always sent so long outputs are not truncated.
     - Non-retryable HTTP codes (401/402/403/400/422) fail immediately with the
       status exposed; only 429/5xx/transport errors retry with backoff.
-    - A model failure falls back to ``deepseek-v4-flash`` (official V4 pair).
+    - A model failure falls back to the configured fallback model.
     """
-    fallback_models = [FALLBACK_MODEL]
-    if model_name not in fallback_models:
-        fallback_models.insert(0, model_name)
+    base_url = get_base_url()
+    primary_model = model_name or get_model_name()
+    fallback_models = [get_fallback_model()]
+    if primary_model not in fallback_models:
+        fallback_models.insert(0, primary_model)
 
     last_error = None
     caller_label = caller or "unknown"
@@ -112,7 +146,7 @@ def access_deepseek(text, max_retry=3, model_name=DEFAULT_MODEL,
                 }
 
                 response = requests.post(
-                    API_URL,
+                    base_url,
                     headers=headers,
                     data=json.dumps(data),
                     timeout=300,
@@ -120,7 +154,7 @@ def access_deepseek(text, max_retry=3, model_name=DEFAULT_MODEL,
                 if response.status_code in _NON_RETRYABLE_STATUS:
                     raise ProviderCallError(
                         response.status_code,
-                        f"DeepSeek API {response.status_code}: {response.text[:300]}",
+                        f"LLM API {response.status_code}: {response.text[:300]}",
                     )
                 response.raise_for_status()
 

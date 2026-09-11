@@ -449,14 +449,18 @@ def _provider_health(call=None) -> dict:
     import os
     import time
 
-    if not (os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("DEEPSEEK_API_KEY_1")):
+    if not (
+        os.environ.get("LLM_API_KEY")
+        or os.environ.get("DEEPSEEK_API_KEY")
+        or os.environ.get("DEEPSEEK_API_KEY_1")
+    ):
         return {
             "ok": False,
             "reason": "missing_key",
-            "hint": "设置环境变量 DEEPSEEK_API_KEY 后重启",
+            "hint": "请设置环境变量 LLM_API_KEY（或 DEEPSEEK_API_KEY）后重启",
             "latency_ms": None,
         }
-    from tools_call_deepseek import access_deepseek
+    from tools_call_deepseek import access_deepseek, get_model_name
 
     probe = call or access_deepseek
     started = time.monotonic()
@@ -465,7 +469,7 @@ def _provider_health(call=None) -> dict:
         return {
             "ok": True,
             "latency_ms": round((time.monotonic() - started) * 1000),
-            "model": "deepseek-v4-pro",
+            "model": get_model_name(),
         }
     except Exception as error:  # noqa: BROAD_EXCEPT_OK - surface the raw provider failure
         return {
