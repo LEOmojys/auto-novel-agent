@@ -275,3 +275,53 @@ def test_agent_loop_uses_loop_state_after_repair(projects_root: Path) -> None:
         assert final.step >= 2
     finally:
         database.__exit__(None, None, None)
+
+
+def test_agent_loop_approval_pause_and_resume(projects_root: Path) -> None:
+    """Approval mode: write_world stages + pauses; loop stops; pending action persisted."""
+    from novel_agent.default_stage import _AgentLoopStage
+    from novel_agent.pathing import ProjectPathResolver
+    from novel_agent.run_coordinator import RunCoordinator
+    from novel_agent.run_models import StartRunRequest
+    from novel_agent.run_worker import RunWorker
+    from novel_agent.service_models import StartNovelRunRequest as S
+
+    database = connect_project_database(projects_root / PROJECT_ID.root)
+    connection = database.__enter__()
+    try:
+        from novel_agent.storage import migrate
+
+        migrate(connection)
+        coordinator = RunCoordinator(connection, lambda: FIXED_TIME)
+        req = S(project_id=PROJECT_ID, run_id="run-approve", idempotency_key="start-approve",
+                user_requirements="写一本一章的小说", provider="agent_loop", auto_approve=False)
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="run-approve", idempotency_key="start-approve"))
+        stage = _AgentLoopStage(
+            coordinator, req, ProjectPathResolver(projects_root.parent), lambda: FIXED_TIME,
+            transport=_LoopBriefTransport(),
+            loop_transport=_LoopDecisionTransport(),
+            offline_generators=True,
+        )
+        worker = RunWorker(coordinator, stage, stage_timeout_seconds=30.0)
+        lease = coordinator.claim_next("worker")
+        assert lease is not None
+        worker.run(lease)
+        # write_world is approval-gated: run paused, artifact staged, loop stopped.
+        state = connection.execute("SELECT state FROM runs WHERE run_id='run-approve'").fetchone()
+        assert state == (RunStatus.WAITING_REVIEW.value,)
+        staged = connection.execute(
+            "SELECT kind FROM artifacts WHERE run_id='run-approve' AND status='staged'"
+        ).fetchall()
+        assert any(str(r[0]) == "world_bible" for r in staged)
+        from novel_agent.loop_state import load_loop_state
+
+        ls = load_loop_state(connection, "run-approve")
+        assert ls is not None
+        assert ls.pending_action is not None and ls.pending_action["tool"] == "write_world"
+        # tool_call events streamed with summary (replayable history)
+        tool_events = connection.execute(
+            "SELECT payload_json FROM run_events WHERE run_id='run-approve' AND event_type='tool_call'"
+        ).fetchall()
+        assert len(tool_events) >= 1
+    finally:
+        database.__exit__(None, None, None)

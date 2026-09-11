@@ -285,6 +285,31 @@ class AgentLoop:
                     delay *= self.config.retry_backoff_factor
         return None
 
+    def _summarize_history(self, messages: Sequence[LoopMessage]) -> str:
+        """Deterministic structured summary of a compressed history head.
+
+        Lists the tool calls made (and whether each succeeded) so the model
+        retains the essential progress without the raw trace — matching the
+        opencode compaction intent of a "continue prompt", without a recursive
+        model call (which could itself overflow).
+        """
+        tools_done: list[str] = []
+        tools_failed: list[str] = []
+        for message in messages:
+            if message.role == "tool" and message.tool_name:
+                if message.tool_ok:
+                    tools_done.append(message.tool_name)
+                else:
+                    tools_failed.append(message.tool_name)
+        parts = ["（以下为较早步骤的压缩摘要）"]
+        if tools_done:
+            parts.append("已完成：" + ", ".join(dict.fromkeys(tools_done)))
+        if tools_failed:
+            parts.append("曾失败：" + ", ".join(dict.fromkeys(tools_failed)))
+        if len(parts) == 1:
+            parts.append("（早期步骤无工具调用记录）")
+        return "；".join(parts)
+
     def run(
         self,
         *,
@@ -292,9 +317,17 @@ class AgentLoop:
         task: str,
         memory_snapshot: str = "",
         recent_artifacts: Sequence[str] = (),
+        initial_history: Sequence[LoopMessage] = (),
     ) -> tuple[str, list[LoopMessage]]:
-        """Run the loop until done / step limit. Returns (outcome, history)."""
+        """Run the loop until done / step limit. Returns (outcome, history).
+
+        ``initial_history`` resumes a previously-paused loop (approval gate /
+        repair): the caller replays the persisted tool-call trace so the model
+        keeps its context instead of starting from scratch.
+        """
         history: list[LoopMessage] = [LoopMessage(role="user", content=task)]
+        if initial_history:
+            history = [*initial_history, *history] if initial_history[0].role != "user" else [*initial_history]
         doom_tally: list[tuple[str, str]] = []
         doomed: set[tuple[str, str]] = set()
         recent_tool_calls: list[str] = []
@@ -315,14 +348,19 @@ class AgentLoop:
                 ),
                 list(self.tools.values()),
             )) > self.config.compact_threshold and len(history) > self.config.history_window:
-                # keep task + most recent K messages (head/tail split)
+                # head/tail split with a deterministic structured summary: the
+                # older head is replaced by a compact "what was done" note so
+                # the model keeps the essential progress without the raw trace.
+                head = history[: -self.config.history_window]
                 tail = history[-self.config.history_window :]
+                summary = self._summarize_history(head)
+                tail = [LoopMessage(role="assistant", content=summary), *tail]
                 if history[0].role == "user" and history[0] not in tail:
                     tail = [history[0], *tail]
                 history = tail
                 total_chars = 0
                 if self.event_sink is not None:
-                    self.event_sink("loop_compacted", {"kept": len(history)})
+                    self.event_sink("loop_compacted", {"kept": len(history), "summary": summary})
 
             prompt = render_loop_prompt(
                 build_loop_context(
@@ -394,7 +432,19 @@ class AgentLoop:
             ))
             recent_tool_calls.append(action.tool)
             if self.event_sink is not None:
-                self.event_sink("tool_call", {"tool": action.tool, "ok": result.ok})
+                self.event_sink("tool_call", {
+                    "tool": action.tool,
+                    "ok": result.ok,
+                    "summary": (result.summary or "")[:400],
+                    "requires_approval": result.requires_approval,
+                })
+            if result.requires_approval:
+                # An approval-gated tool staged its output and paused the run:
+                # stop the loop so the user can review; REPAIR resumes from
+                # the persisted loop state.
+                if self.event_sink is not None:
+                    self.event_sink("loop_waiting_approval", {"tool": action.tool})
+                return "waiting_approval", tuple(history)
         if self.event_sink is not None:
             self.event_sink("loop_step_limit", {"steps": self.config.max_steps})
         return "step_limit", tuple(history)

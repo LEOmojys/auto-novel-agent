@@ -173,14 +173,14 @@ def _catalog(ctx: NovelToolContext):
 
 
 def _commit_or_stage(ctx: NovelToolContext, kind: str, node_id: str, raw_bytes: bytes) -> ToolResult:
-    """Shared governance tail: commit directly or stage for approval.
+    """Approval-mode governance tail: stage the artifact and pause the loop.
 
-    Returns a ToolResult; in approval mode the run is paused via
-    ``stage_artifact_for_approval`` and the loop must stop so the user can
-    review (the caller checks ``requires_approval``).
+    Used by write_* tools when ``auto_approve=False``; the generated artifact
+    is written as ``staged`` and the run paused via
+    ``stage_artifact_for_approval``.  The AgentLoop detects
+    ``requires_approval=True`` and stops, so the user can review; REPAIR
+    resumes from the persisted loop state.
     """
-    if ctx.auto_approve:
-        return ToolResult(ok=True, summary=f"{kind} 已生成并入库。", artifact_ref=node_id)
     from novel_agent.domains.novel import stage_artifact_for_approval
 
     artifact_id = stage_artifact_for_approval(
@@ -213,6 +213,9 @@ def _make_write_world(ctx: NovelToolContext) -> AgentTool:
         result = generate_world_step(ctx.plugin.planning_generator, ctx.gateway, ctx.lease, brief, selected)
         if isinstance(result, SchemaFailure):
             return ToolResult(ok=False, error="世界观 schema 解析失败")
+        if not ctx.auto_approve:
+            # Approval mode: stage the artifact and pause the loop for review.
+            return _commit_or_stage(ctx, "world_bible", "loop:world", result.raw.raw_bytes)
         from novel_agent.domains.novel_commit import commit_world_only
 
         commit_world_only(
@@ -260,6 +263,8 @@ def _make_write_cast(ctx: NovelToolContext) -> AgentTool:
             result = generate_cast_step(ctx.plugin.planning_generator, ctx.gateway, ctx.lease, brief, world, selected)
         if isinstance(result, SchemaFailure):
             return ToolResult(ok=False, error="角色 schema 解析失败")
+        if not ctx.auto_approve:
+            return _commit_or_stage(ctx, "character_set", "loop:cast", result.raw.raw_bytes)
         from novel_agent.domains.novel_commit import commit_cast_only
 
         commit_cast_only(
@@ -304,6 +309,9 @@ def _make_write_outline(ctx: NovelToolContext) -> AgentTool:
         )
         if isinstance(result, SchemaFailure):
             return ToolResult(ok=False, error="大纲 schema 解析失败")
+        plan = result.value
+        if not ctx.auto_approve:
+            return _commit_or_stage(ctx, "plan_contract", "loop:outline", result.raw.raw_bytes)
         from novel_agent.domains.novel_commit import commit_outline_only
 
         commit_outline_only(
@@ -317,7 +325,6 @@ def _make_write_outline(ctx: NovelToolContext) -> AgentTool:
             committed_at=ctx.now(),
             complete=False,
         )
-        plan = result.value
         ctx.plan_ref = (plan.plan_id, 1)
         chapters = f"共{len(plan.chapters)}章：{ctx._summary(plan.model_dump_json(), 300)}"
         return ToolResult(ok=True, summary=f"故事大纲已生成（{chapters}）", artifact_ref=plan.plan_id)

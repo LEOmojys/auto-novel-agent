@@ -738,6 +738,14 @@ class _AgentLoopStage:
     loop_transport: ProviderTransport | None = None
     offline_generators: bool = False
 
+    def _has_required_chapters(self) -> bool:
+        """Premature-done guard: brief requiring chapters must yield ≥1 accepted."""
+        row = self.coordinator.connection.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE run_id = ? AND kind = 'chapter' AND status = 'accepted'",
+            (self.request.run_id,),
+        ).fetchone()
+        return row is not None and int(row[0]) >= 1
+
     def execute(
         self,
         recovery: RunRecoveryState,
@@ -881,10 +889,14 @@ class _AgentLoopStage:
                 "agent_loop", "deepseek-v4-pro", "provider_failure", reason, ""
             ),
         )
+        # Resume a previously-paused loop (approval/repair) by replaying the
+        # persisted tool-call trace so the model keeps its context.
+        initial_history = _replay_loop_history(self.coordinator.connection, self.request.run_id)
         outcome, history = loop.run(
             system_prompt=_LOOP_SYSTEM_PROMPT.format(tools=", ".join(tools)),
             task=self.request.user_requirements,
             memory_snapshot=existing_assets_summary(existing_assets),
+            initial_history=initial_history,
         )
 
         # 5) Persist the final loop state and finish.
@@ -900,7 +912,31 @@ class _AgentLoopStage:
 
         if cancellation is not None and cancellation.is_cancelled():
             return
+        if outcome == "waiting_approval":
+            # An approval-gated tool staged its output; the run is already
+            # WAITING_REVIEW.  Persist the pending action so REPAIR resumes it.
+            pending = history[-1].tool_args if history and history[-1].role == "tool" else None
+            pending_tool = history[-1].tool_name if history and history[-1].role == "tool" else None
+            if pending_tool:
+                save_loop_state(
+                    self.coordinator.connection,
+                    LoopState(
+                        run_id=self.request.run_id,
+                        step=len(history),
+                        plan_ref=ctx.plan_ref,
+                        pending_action={"tool": pending_tool, "args": pending or {}},
+                        written_chapters=state.written_chapters,
+                    ),
+                    self.now(),
+                )
+            return
         if outcome == "done":
+            # Premature-done guard (R1.3): if the brief requires chapters but
+            # none were accepted, do not finish silently — fail so REPAIR can
+            # continue.
+            if not self._has_required_chapters():
+                self.coordinator.fail_run(recovery.lease, "agent_loop_done_without_chapters")
+                return
             # Chapters were committed by the write_chapter tool; complete the
             # run if nothing left it in a terminal state.
             _finish_run_if_pending(self.coordinator, self.request.run_id, self.now)
@@ -938,6 +974,40 @@ def _story_brief_for_loop(brief: BriefContract):
         created_at=brief.created_at,
         provenance=brief.provenance,
     )
+
+
+def _replay_loop_history(connection, run_id: str):
+    """Replay persisted tool-call events into an initial LoopMessage history.
+
+    Lets a REPAIR resume an agent_loop run from where it paused (approval
+    gate) instead of starting the model's decision loop from scratch.
+    """
+    from novel_agent.agent_loop import LoopMessage
+
+    rows = connection.execute(
+        "SELECT event_type, payload_json FROM run_events WHERE run_id = ? "
+        "AND event_type IN ('tool_call', 'loop_done') ORDER BY sequence",
+        (run_id,),
+    ).fetchall()
+    messages: list[LoopMessage] = []
+    for event_type, payload_json in rows:
+        try:
+            payload = json.loads(str(payload_json))
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if event_type == "tool_call":
+            tool = str(payload.get("tool", ""))
+            ok = bool(payload.get("ok", True))
+            summary = str(payload.get("summary", "") or "")
+            messages.append(LoopMessage(
+                role="tool", content=summary or f"{tool} 执行完成",
+                tool_name=tool, tool_ok=ok,
+            ))
+        elif event_type == "loop_done":
+            messages.append(LoopMessage(
+                role="assistant", content=str(payload.get("reply", "") or "完成"),
+            ))
+    return tuple(messages)
 
 
 @dataclass(frozen=True, slots=True)
