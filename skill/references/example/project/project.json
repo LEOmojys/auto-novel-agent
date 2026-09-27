@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "title": "《雾港灯塔》",
+  "synopsis": "在常年起雾的滨海小城，灯塔看守人的女儿伊澄继承了父亲的遗物——一盏能看见亡者记忆的旧提灯。",
+  "genre": "奇幻 / 悬疑",
+  "target_chapter_count": 12,
+  "style_guidance": ["第三人称有限视角", "阴郁但不压抑", "慢热悬疑"],
+  "status": "in_progress",
+  "progress": { "written_chapters": [1], "current": 1 }
+}

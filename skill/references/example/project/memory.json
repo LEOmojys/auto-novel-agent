@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "characters": {
+    "伊澄": {
+      "abilities": ["能看见亡者记忆（提灯）"],
+      "relationships": { "父亲": "失踪中" },
+      "status": "雾港家中"
+    },
+    "老陈": {
+      "abilities": [],
+      "relationships": { "伊澄父亲": "旧识，知情人" },
+      "status": "旧码头"
+    }
+  },
+  "plot_threads": [
+    { "thread": "伊澄父亲失踪真相", "status": "open", "last_mentioned": 1 },
+    { "thread": "旧提灯的来源与力量", "status": "open", "last_mentioned": 1 }
+  ],
+  "world_rules_used": ["雾在入夜后变浓，浓雾中会出现亡者的影子"],
+  "rules": [
+    "已写章节：1；下一章从 2 开始",
+    "旧提灯可照见亡者记忆，但可能有代价（未定）"
+  ]
+}

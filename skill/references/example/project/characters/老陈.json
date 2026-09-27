@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "name": "老陈",
+  "role": "配角 / 旧码头守夜人",
+  "role_introduction": "与伊澄父亲相识的老水手",
+  "role_personality": "话多、爱讲旧事，知道雾港的秘密",
+  "goal": "守住某个不可告人的秘密",
+  "traits": ["贪杯", "口风严"],
+  "plot_history": []
+}
