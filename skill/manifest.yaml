@@ -1,0 +1,27 @@
+name: novel-agent
+version: 1.0.0
+description: >
+  AI 长篇小说创作 Agent。agent 亲自担任创作 Agent：调 LLM 生成内容，产物保存为
+  JSON 项目文件夹，负责质量审查与前后文一致性维护。触发词：写小说、续写、回滚、
+  设定世界观/角色/大纲、查询创作进度。
+
+always_load:
+  - references/planact.md
+  - references/quality-six-dim.md
+  - references/memory-consistency.md
+
+commands:
+  create:   commands/create.md
+  continue: commands/continue.md
+  revise:   commands/revise.md
+  rollback: commands/rollback.md
+  status:   commands/status.md
+  elements: commands/elements.md
+
+schemas:
+  project:   schemas/project.schema.json
+  world:     schemas/world.schema.json
+  character: schemas/character.schema.json
+  outline:   schemas/outline.schema.json
+  chapter:   schemas/chapter.schema.json
+  memory:    schemas/memory.schema.json
