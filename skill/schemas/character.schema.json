@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/novel/character.schema.json",
+  "title": "Character",
+  "description": "角色档案：身份、性格、目标、特质、剧情经历。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "name"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "role": { "type": "string", "description": "在故事中的身份（女主角/反派/配角等）" },
+    "role_introduction": { "type": "string", "description": "一句话介绍" },
+    "role_personality": { "type": "string", "description": "性格描述" },
+    "goal": { "type": "string", "description": "角色核心目标/动机" },
+    "traits": { "type": "array", "items": { "type": "string" } },
+    "plot_history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["chapter", "event"],
+        "properties": {
+          "chapter": { "type": "integer", "minimum": 1 },
+          "event": { "type": "string" }
+        }
+      }
+    }
+  }
+}

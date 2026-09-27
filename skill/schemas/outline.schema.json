@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/novel/outline.schema.json",
+  "title": "Outline",
+  "description": "故事大纲：卷/弧线与逐章规划。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "chapters"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "story_arcs": { "type": "array", "items": { "type": "string" } },
+    "chapters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["number", "title", "goal"],
+        "properties": {
+          "number": { "type": "integer", "minimum": 1 },
+          "title": { "type": "string" },
+          "goal": { "type": "string" },
+          "beats": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

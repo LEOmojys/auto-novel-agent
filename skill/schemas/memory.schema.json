@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/novel/memory.schema.json",
+  "title": "Memory",
+  "description": "设定记忆与一致性追踪：角色状态、伏笔、进度规则。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "characters": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "abilities": { "type": "array", "items": { "type": "string" } },
+          "relationships": { "type": "object" },
+          "status": { "type": "string", "description": "当前状态（在场/受伤/失踪等）" }
+        }
+      }
+    },
+    "plot_threads": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["thread", "status"],
+        "properties": {
+          "thread": { "type": "string" },
+          "status": { "enum": ["open", "resolved", "dropped"] },
+          "last_mentioned": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "world_rules_used": { "type": "array", "items": { "type": "string" } },
+    "rules": { "type": "array", "items": { "type": "string" }, "description": "自由格式的创作规则/约束" }
+  }
+}

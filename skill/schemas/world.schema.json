@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/novel/world.schema.json",
+  "title": "World",
+  "description": "世界观设定：前提、规则、约束、关键地点。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "title", "premise"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "premise": { "type": "string", "minLength": 1 },
+    "rules": { "type": "array", "items": { "type": "string" } },
+    "constraints": { "type": "array", "items": { "type": "string" } },
+    "locations": { "type": "array", "items": { "type": "string" } }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/novel/project.schema.json",
+  "title": "Project",
+  "description": "元数据与进度：一部小说的总览。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "title", "synopsis", "genre", "target_chapter_count", "status"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "synopsis": { "type": "string" },
+    "genre": { "type": "string" },
+    "target_chapter_count": { "type": "integer", "minimum": 1 },
+    "style_guidance": { "type": "array", "items": { "type": "string" } },
+    "status": { "enum": ["in_progress", "paused", "finished"] },
+    "progress": {
+      "type": "object",
+      "properties": {
+        "written_chapters": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+        "current": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

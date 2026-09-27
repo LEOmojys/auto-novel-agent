@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/novel/chapter.schema.json",
+  "title": "Chapter",
+  "description": "单章正文：标题、出场角色、正文、摘要、伏笔。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "number", "title", "body"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "number": { "type": "integer", "minimum": 1 },
+    "title": { "type": "string" },
+    "goal": { "type": "string", "description": "对应 outline 本章 goal" },
+    "characters": { "type": "array", "items": { "type": "string" }, "description": "出场角色名" },
+    "body": { "type": "string", "minLength": 1, "description": "正文全文" },
+    "summary": { "type": "string", "description": "剧情摘要（供续写/记忆用）" },
+    "word_count": { "type": "integer", "minimum": 0 },
+    "foreshadows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item", "hint"],
+        "properties": {
+          "item": { "type": "string" },
+          "hint": { "type": "string" },
+          "payoff_chapter": { "type": ["integer", "null"] }
+        }
+      }
+    }
+  }
+}
