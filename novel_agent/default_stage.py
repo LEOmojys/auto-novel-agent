@@ -20,6 +20,7 @@ from novel_agent.chapter_executor import (
     MemoryExtractor,
 )
 from novel_agent.domains.novel import detect_existing_assets, existing_assets_summary
+from novel_agent.domains.quality_runtime import LazyProviderQualityReviewer
 from novel_agent.contracts import Provenance, ProvenanceKind, RunStatus, StoryBrief
 from novel_agent.offline_fake import (
     OfflineChapterGenerator,
@@ -103,6 +104,7 @@ def _call_deepseek(
     model_name: str,
     return_tokens: Literal[True],
     caller: str,
+    cancellation: object | None = None,
 ) -> tuple[str, Mapping[str, int | str]]:
     from tools_call_deepseek import access_deepseek
 
@@ -112,6 +114,7 @@ def _call_deepseek(
         model_name=model_name,
         return_tokens=return_tokens,
         caller=caller,
+        cancellation=cancellation,
     )
 
 
@@ -253,16 +256,6 @@ def _revise_target_chapter(connection, run_id: str) -> int | None:
     return chapter_number if chapter_number >= 1 else None
 
 
-def _plan_approval_pending(connection, run_id: str) -> bool:
-    """True when a generated plan is waiting for user confirmation."""
-    row = connection.execute(
-        "SELECT state FROM commands WHERE run_id = ? AND command_type = 'plan_proposed' "
-        "ORDER BY created_at DESC, command_id DESC LIMIT 1",
-        (run_id,),
-    ).fetchone()
-    return row is not None and str(row[0]) == "proposed"
-
-
 def _load_approved_plan(connection, run_id: str):
     """Return the approved plan JSON (as model steps) or None."""
     import json as json_module
@@ -374,6 +367,36 @@ class _UnavailableTransport:
             kind=ProviderFailureKind.CONFIGURATION,
             detail="provider transport disabled for offline stage",
         )
+
+
+def _continuity_auditor(
+    *,
+    transport: ProviderTransport,
+    now: Callable[[], datetime],
+    run_id: str,
+    prompt: str | None,
+    failure_sink: Callable[[str, str, str, str, str], None] | None,
+    call_event_sink: Callable[[str, str, str], None] | None,
+    offline: bool = False,
+) -> object:
+    """Provider-backed continuity audit, with an explicit offline switch.
+
+    `NOVEL_AGENT_CONTINUITY_AUDIT=offline` keeps deterministic test doubles in
+    place; production defaults to the live structured auditor.
+    """
+    mode = os.environ.get("NOVEL_AGENT_CONTINUITY_AUDIT", "llm").strip().lower()
+    if offline or mode in {"offline", "deterministic", "none"}:
+        return OfflineContinuityAuditor()
+    from novel_agent.domains.continuity_evaluators import ProviderContinuityAuditor
+
+    return ProviderContinuityAuditor(
+        transport=transport,
+        now=now,
+        run_id=run_id,
+        prompt=prompt,
+        failure_sink=failure_sink,
+        call_event_sink=call_event_sink,
+    )
 
 
 def _real_reviewer_factory(
@@ -669,12 +692,20 @@ class _LegacyStage:
         )
         from novel_agent.agent.plan_generator import PlanGenerator
 
+        auditor = _continuity_auditor(
+            transport=transport,
+            now=self.now,
+            run_id=self.request.run_id,
+            prompt=templates.get("continuity-audit"),
+            failure_sink=failure_sink,
+            call_event_sink=call_event_sink,
+        )
         gateway = _build_tool_gateway(
             self.coordinator,
             planning_generator=generator,
             chapter_generator=generator,
             extractor=generator,
-            auditor=OfflineContinuityAuditor(),
+            auditor=auditor,
             reviewer=lambda: reviewer_holder["current"],
         )
         _execute_graph_stage(
@@ -691,7 +722,7 @@ class _LegacyStage:
             planning_generator=generator,
             chapter_generator=generator,
             extractor=generator,
-            auditor=OfflineContinuityAuditor(),
+            auditor=auditor,
             reviewer_holder=reviewer_holder,
             memory_names_holder=memory_names_holder,
             plan_generator=PlanGenerator(
@@ -739,11 +770,13 @@ class _AgentLoopStage:
     loop_transport: ProviderTransport | None = None
     offline_generators: bool = False
 
-    def _has_required_chapters(self, brief: object) -> bool:
-        """Premature-done guard: brief requiring chapters must yield ≥1 accepted.
+    def _has_required_chapters(self, brief: object, expected_chapters: int = 0) -> bool:
+        """Premature-done guard: brief requiring chapters must yield enough.
 
-        Only full-novel requests (chapters expected) are guarded; world-only /
-        outline-only requests legitimately finish without any chapter.
+        For full-novel requests the accepted chapter count must reach the
+        number of write_chapter steps actually planned (e.g. "续写两章" plans
+        two chapters and must accept both); world-only / outline-only requests
+        legitimately finish with none.
         """
         intent = getattr(brief, "intent", None)
         if intent not in ("full_novel", None):
@@ -752,7 +785,10 @@ class _AgentLoopStage:
             "SELECT COUNT(*) FROM artifacts WHERE run_id = ? AND kind = 'chapter' AND status = 'accepted'",
             (self.request.run_id,),
         ).fetchone()
-        return row is not None and int(row[0]) >= 1
+        accepted = int(row[0]) if row is not None else 0
+        if expected_chapters > 0:
+            return accepted >= expected_chapters
+        return accepted >= 1
 
     def execute(
         self,
@@ -799,12 +835,26 @@ class _AgentLoopStage:
             )
             chapter_generator = generator
             extractor = generator
-            auditor = OfflineContinuityAuditor()
-            reviewer_holder = {"current": OfflineQualityReviewer()}
-        existing_assets = detect_existing_assets(
-            self.path_resolver.resolve_project(self.request.project_id),
-            connection=self.coordinator.connection,
-        )
+            auditor = _continuity_auditor(
+                transport=self.transport or decision_transport,
+                now=self.now,
+                run_id=self.request.run_id,
+                prompt=templates.get("continuity-audit"),
+                failure_sink=failure_sink,
+                call_event_sink=call_event_sink,
+            )
+            reviewer_holder = {
+                "current": LazyProviderQualityReviewer(
+                    connection=self.coordinator.connection,
+                    project_id=self.request.project_id,
+                    run_id=self.request.run_id,
+                    transport=self.transport or decision_transport,
+                    now=self.now,
+                    prompt=templates.get("quality-review"),
+                    failure_sink=failure_sink,
+                    call_event_sink=call_event_sink,
+                )
+            }
         gateway = _build_tool_gateway(
             self.coordinator,
             planning_generator=generator,
@@ -844,6 +894,7 @@ class _AgentLoopStage:
                     "style": ",".join(brief.style_guidance),
                     "acceptance": ",".join(brief.acceptance_criteria),
                     "chapter_count": brief.target_chapter_count or 0,
+                    "fresh": brief.fresh,
                 },
                 self.now(),
             ),
@@ -851,6 +902,17 @@ class _AgentLoopStage:
         if brief.intent == _INTENT_UNRECOGNIZED and not brief.degraded:
             self.coordinator.fail_run(recovery.lease, "intent_recognition_failed")
             return
+
+        # 1b) Existing assets for reuse.  A "new story" request (brief.fresh)
+        # must NOT reuse the project's old world/cast/outline — start clean.
+        existing_assets = (
+            {}
+            if brief.fresh
+            else detect_existing_assets(
+                self.path_resolver.resolve_project(self.request.project_id),
+                connection=self.coordinator.connection,
+            )
+        )
 
         # 2) Load persisted loop state (approval / repair resume point).
         prior = load_loop_state(self.coordinator.connection, self.request.run_id)
@@ -896,15 +958,31 @@ class _AgentLoopStage:
             failure_sink=lambda _caller, reason: failure_sink(
                 "agent_loop", "deepseek-v4-pro", "provider_failure", reason, ""
             ),
+            cancellation=cancellation,
         )
         # Resume a previously-paused loop (approval/repair) by replaying the
         # persisted tool-call trace so the model keeps its context.
         initial_history = _replay_loop_history(self.coordinator.connection, self.request.run_id)
+        loop_prompt = _LOOP_SYSTEM_PROMPT.format(
+            tools=", ".join(tools),
+            intent=str(brief.intent or ""),
+            constraints="；".join(brief.constraints or ()) or "（无）",
+            acceptance="；".join(brief.acceptance_criteria or ()) or "（无）",
+            style="；".join(brief.style_guidance or ()) or "（无）",
+            chapter_count=str(brief.target_chapter_count or ""),
+            asset_rule=(
+                "这是全新故事：必须重建世界观/角色/大纲，不得沿用或参考项目已有设定。"
+                if brief.fresh
+                else "已有设定（世界观/角色/大纲/已写章节）不要重复生成；续写时只规划缺失的章节。"
+            ),
+        )
         outcome, history = loop.run(
-            system_prompt=_LOOP_SYSTEM_PROMPT.format(tools=", ".join(tools)),
+            system_prompt=loop_prompt,
             task=self.request.user_requirements,
             memory_snapshot=existing_assets_summary(existing_assets),
             initial_history=initial_history,
+            initial_plan=prior.remaining_plan if prior is not None else (),
+            initial_plan_index=prior.plan_index if prior is not None else 0,
         )
 
         # 5) Persist the final loop state and finish.
@@ -922,9 +1000,11 @@ class _AgentLoopStage:
             return
         if outcome == "waiting_approval":
             # An approval-gated tool staged its output; the run is already
-            # WAITING_REVIEW.  Persist the pending action so REPAIR resumes it.
+            # WAITING_REVIEW.  Persist the pending action AND the remaining
+            # plan so REPAIR resumes the rest of the plan, not just replans.
             pending = history[-1].tool_args if history and history[-1].role == "tool" else None
             pending_tool = history[-1].tool_name if history and history[-1].role == "tool" else None
+            remaining = tuple(loop.current_plan[loop.plan_index :])
             if pending_tool:
                 save_loop_state(
                     self.coordinator.connection,
@@ -934,15 +1014,20 @@ class _AgentLoopStage:
                         plan_ref=ctx.plan_ref,
                         pending_action={"tool": pending_tool, "args": pending or {}},
                         written_chapters=state.written_chapters,
+                        remaining_plan=remaining,
+                        plan_index=0,  # remaining_plan is already trimmed; resume from its head
                     ),
                     self.now(),
                 )
             return
         if outcome == "done":
             # Premature-done guard (R1.3): if the brief requires chapters but
-            # none were accepted, do not finish silently — fail so REPAIR can
-            # continue.
-            if not self._has_required_chapters(brief):
+            # fewer than planned were accepted, do not finish silently — fail
+            # so REPAIR can continue.
+            planned_chapters = sum(
+                1 for tool, _args in loop.current_plan if tool == "write_chapter"
+            )
+            if not self._has_required_chapters(brief, planned_chapters):
                 self.coordinator.fail_run(recovery.lease, "agent_loop_done_without_chapters")
                 return
             # Chapters were committed by the write_chapter tool; complete the
@@ -952,29 +1037,55 @@ class _AgentLoopStage:
         if outcome == "step_limit":
             self.coordinator.fail_run(recovery.lease, "agent_loop_step_limit")
             return
+        if outcome == "cancelled":
+            # The user cancelled while the loop was running; the run is already
+            # in CANCEL_REQUESTED — finalize it as cancelled so it leaves the
+            # terminal state cleanly.
+            row = self.coordinator.connection.execute(
+                "SELECT state FROM runs WHERE run_id = ?", (self.request.run_id,)
+            ).fetchone()
+            if row is not None and str(row[0]) in (RunStatus.RUNNING.value, RunStatus.CANCEL_REQUESTED.value):
+                self.coordinator.connection.execute(
+                    "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
+                    (RunStatus.CANCELLED.value, self.now().isoformat(), self.request.run_id),
+                )
+                append_run_event(
+                    self.coordinator.connection,
+                    RunEvent(self.request.run_id, "run_cancelled", {}, self.now()),
+                )
+            return
         # provider_failed: leave the run failed so REPAIR can retry.
         self.coordinator.fail_run(recovery.lease, "agent_loop_provider_failed")
 
 
-_LOOP_SYSTEM_PROMPT = """你是小说创作 Agent，工作范式为 Plan-Act：先规划，再按计划依次执行。
+_LOOP_SYSTEM_PROMPT = """你是小说创作 Agent，工作范式为 Plan-Act（先意图分析，再任务规划，再按计划依次执行）。
 
 可用工具：{tools}
 
-工作方式：
-1. 规划：先分析用户需求与已有设定，首轮输出执行计划（按依赖顺序，已有内容不要重复生成）：
-   {{"plan": [{{"tool": "write_chapter", "args": {{"chapter_number": 1}}}}], "thought": "为什么这样安排"}}
-   系统会立即执行计划的第一步，并把每一步的结果反馈给你。
-2. 执行：每一步之后你决定：
-   - 继续计划下一步：{{"next": true}}
-   - 调整计划：输出新的 plan 覆盖剩余步骤，或直接调用工具 {{"tool": "工具名", "args": {{...}}}}
-   - 任务完成：{{"done": true, "reply": "总结"}}
+## 意图分析（系统已完成）
+系统已对你的需求做过意图分析，以下是分析结果——你的规划必须严格基于它：
+- 意图（intent）：{intent}
+- 约束（constraints）：{constraints}
+- 验收标准（acceptance）：{acceptance}
+- 风格要求（style）：{style}
+- 目标章数（chapter_count）：{chapter_count}
 
-规则：
+## 工作方式
+1. 规划：基于意图分析结果与已有设定，首轮输出执行计划（按依赖顺序，已有内容不要重复生成）：
+   {{"plan": [{{"tool": "write_chapter", "args": {{"chapter_number": 1}}}}], "thought": "为什么这样安排"}}
+   系统会按计划**自动依次执行**每一步，并把每一步的结果反馈给你。
+2. 执行（系统自动推进，你只需在必要时介入）：
+   - 计划全部执行完或某步失败后，你决定：
+     - 任务完成：{{"done": true, "reply": "总结"}}
+     - 继续/补充：输出新的 plan 覆盖剩余步骤，或直接调用工具 {{"tool": "工具名", "args": {{...}}}}
+   - 也可以随时用 {{"next": true}} 推进计划剩余步骤。
+
+## 规则
 1. 依赖顺序：世界观 → 角色 → 大纲 → 章节；写章节前必须已有对应大纲。
-2. 已有设定（世界观/角色/大纲/已写章节）不要重复生成；续写时只规划缺失的章节。
+2. {asset_rule}
 3. write_chapter 需要 chapter_number；"续写下一章"从已写章节的下一章开始。
 4. 严格使用可用工具名，不要编造工具。
-5. 首轮必须先输出 plan，不要直接调用工具；计划执行完后确认任务完成再输出 {{"done": true}}。"""
+5. 首轮必须先输出 plan；计划执行完后按验收标准确认任务是否完成，完成则输出 {{"done": true}}。"""
 
 
 def _story_brief_for_loop(brief: BriefContract):

@@ -45,6 +45,26 @@ _INTENT_HINTS: str = (
     '拿不准但看起来确实是创作需求时选 "full_novel"）'
 )
 
+#: Deterministic "new story" signals: the user explicitly wants a DIFFERENT
+#: story than whatever already exists in the project, so old assets must not
+#: be reused.  Used for the brief's ``fresh`` flag (and as a degraded-mode
+#: fallback when the provider analysis fails).
+_FRESH_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:换|另|新)(?:一个|一部|本)?(?:故事|小说|题材|主题)"),
+    re.compile(r"(?:写|开|创作|来)(?:一部|一本|个)?(?:全新|新的|另外|别的|不同的|另一|完全不同)(?:故事|小说|题材|主题|作品)"),
+    re.compile(r"(?:不是|别于|不同于|不要用)(?:之前|原来|上次|刚才).{0,8}(?:那个|这个)?(?:故事|设定|题材|小说)"),
+    re.compile(r"(?:重新|从头)(?:写|开始|构思|创作)"),
+    re.compile(r"(?:抛弃|丢弃|扔掉|清空|重置).{0,10}(?:设定|故事|世界观)"),
+    re.compile(r"(?:不要|舍弃|放弃)(?:之前|原来|以前的|上次的).{0,8}(?:设定|世界观|故事|大纲|角色)"),
+    re.compile(r"(?:和|与)(?:之前|原来|旧).{0,4}(?:故事|设定).{0,6}(?:不同|无关|完全不一样)"),
+)
+
+
+def _is_fresh_story(requirements: str) -> bool:
+    """Whether the request asks for a brand-new story independent of existing assets."""
+    text = requirements.strip()
+    return any(pattern.search(text) for pattern in _FRESH_PATTERNS)
+
 _ANALYSIS_PROMPT: str = """你是一个需求分析器。请分析用户的创作需求，提炼出结构化信息。
 
 ## 用户需求
@@ -59,6 +79,7 @@ _ANALYSIS_PROMPT: str = """你是一个需求分析器。请分析用户的创�
   "acceptance_criteria": ["验收标准，2-5条；如何判断创作符合需求"],
   "chapter_count": 章节数（用户未指定则省略此字段，由系统默认）,
   {intent_hints}
+  "fresh": 是否要求全新故事（true：用户明确要"换一个/新写一个/全新/不同于之前"的故事，此时不要沿用已有世界观/角色/大纲；false：续写或基于已有设定；用户未提则省略或 false）
 }}
 
 只输出 JSON，不要输出 markdown 代码块标记。"""
@@ -80,6 +101,7 @@ class BriefContract(BaseModel):
     style_guidance: tuple[str, ...] = ()
     acceptance_criteria: tuple[str, ...] = ()
     target_chapter_count: int | None = None
+    fresh: bool = False  # True: a brand-new story; do not reuse existing assets
     created_at: datetime
     provenance: Provenance
 
@@ -94,6 +116,7 @@ class _AnalysisContent(BaseModel):
     style_guidance: tuple[str, ...] = ()
     acceptance_criteria: tuple[str, ...] = ()
     chapter_count: int | None = None
+    fresh: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +153,7 @@ class BriefAnalyzer:
             constraints = content.constraints
             style_guidance = content.style_guidance
             acceptance_criteria = content.acceptance_criteria
+            fresh = content.fresh or _is_fresh_story(requirements)
             degraded = False
         else:
             chapter_count = explicit_chapter_count
@@ -139,6 +163,7 @@ class BriefAnalyzer:
             constraints = ()
             style_guidance = ()
             acceptance_criteria = ()
+            fresh = _is_fresh_story(requirements)
             degraded = True
         if chapter_count is None:
             matched = _CHAPTER_COUNT_PATTERN.search(requirements)
@@ -157,6 +182,7 @@ class BriefAnalyzer:
             style_guidance=style_guidance,
             acceptance_criteria=acceptance_criteria,
             target_chapter_count=chapter_count,
+            fresh=fresh,
             created_at=timestamp,
             provenance=Provenance(
                 source_kind=ProvenanceKind.USER_REQUEST,

@@ -351,6 +351,10 @@ def _make_write_chapter(ctx: NovelToolContext) -> AgentTool:
         chapter = next((c for c in plan.chapters if c.chapter_number == chapter_number), None)
         if chapter is None:
             return ToolResult(ok=False, error=f"大纲中没有第 {chapter_number} 章（大纲共 {len(plan.chapters)} 章）。")
+        # A continuation run reuses a previous run's outline; the chapter staging
+        # authority requires the plan to be an accepted artifact of THIS run, so
+        # mirror the reused plan under the current run before writing chapters.
+        plan_revision = _mirror_plan_to_run(ctx, plan, plan_revision)
         force_rewrite = bool(args.get("force_rewrite", False))
         next_chapter = next(
             (c for c in plan.chapters if c.chapter_number == chapter_number + 1), None
@@ -508,6 +512,54 @@ def _resolve_plan(ctx: NovelToolContext):
     from novel_agent.contracts import PlanContract
 
     return PlanContract.model_validate_json(bytes(row[0])), int(row[1])
+
+
+def _mirror_plan_to_run(ctx: NovelToolContext, plan, plan_revision: int) -> int:
+    """Mirror a reused plan contract into the current run as an accepted artifact.
+
+    The chapter staging authority requires the plan to be an accepted artifact
+    of the leased run (``_require_accepted_plan``).  When agent_loop reuses a
+    previous run's outline (write_chapter with an existing plan), the plan is
+    copied under the current run — same bytes, same artifact id, new revision —
+    mirroring the DAG's ``_mirror_reused_plan`` behaviour.  Without this, a
+    continuation run fails with ``ChapterPersistenceError`` on the first
+    write_chapter, which the gateway surfaces as HANDLER_FAILED.
+    """
+    import hashlib as _hashlib
+
+    raw_bytes = plan.model_dump_json().encode()
+    connection = ctx.coordinator.connection
+    row = connection.execute(
+        "SELECT artifact_id, revision FROM artifacts WHERE artifact_id = ? AND run_id = ? "
+        "AND kind = 'plan_contract' AND status = 'accepted' AND is_current = 1",
+        (plan.plan_id, ctx.lease.run_id),
+    ).fetchone()
+    if row is not None:
+        return int(row[1])
+    next_revision = int(
+        connection.execute(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM artifacts WHERE artifact_id = ?",
+            (plan.plan_id,),
+        ).fetchone()[0]
+    )
+    connection.execute(
+        "UPDATE artifacts SET is_current = 0 WHERE artifact_id = ? AND is_current = 1",
+        (plan.plan_id,),
+    )
+    connection.execute(
+        "INSERT INTO artifacts(artifact_id, revision, project_id, run_id, kind, status, raw_bytes, sha256, "
+        "schema_version, is_current, created_at) VALUES (?, ?, ?, ?, 'plan_contract', 'accepted', ?, ?, 1, 1, ?)",
+        (
+            plan.plan_id,
+            next_revision,
+            ctx.brief.project_id.root,
+            ctx.lease.run_id,
+            raw_bytes,
+            _hashlib.sha256(raw_bytes).hexdigest(),
+            ctx.now().isoformat(),
+        ),
+    )
+    return next_revision
 
 
 def _story_brief_from_ctx(ctx: NovelToolContext) -> StoryBrief:

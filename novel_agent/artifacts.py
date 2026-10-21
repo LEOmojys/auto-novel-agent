@@ -22,6 +22,7 @@ from novel_agent.artifact_types import (
     OutboxTargetMismatchError,
     no_fault,
 )
+from novel_agent.memory_store import index_memory
 from novel_agent.pathing import (
     ArtifactExtension,
     ArtifactId,
@@ -47,6 +48,44 @@ class _OutboxEntry:
     raw_bytes: bytes
     sha256: str
     extension: ArtifactExtension
+
+
+def enqueue_materialization(
+    connection: sqlite3.Connection,
+    *,
+    project_id: str,
+    artifact_id: str,
+    revision: int,
+    raw_bytes: bytes,
+    created_at: object,
+    sha256: str | None = None,
+    extension: ArtifactExtension = ArtifactExtension.JSON,
+) -> str:
+    """Enqueue a durable materialization row for one accepted artifact.
+
+    Shared by the planning, chapter and governed commit paths so every
+    accepted artifact is eventually written to `.governed/artifacts/` by
+    `ArtifactService.materialize_pending`.  Idempotent on the content-addressed
+    outbox id.
+    """
+    digest = sha256 or hashlib.sha256(raw_bytes).hexdigest()
+    target_path = ProjectPathResolver.from_config().resolve_export(
+        ProjectId(project_id),
+        ArtifactName(
+            artifact_id=ArtifactId(artifact_id),
+            content_hash=digest,
+            extension=extension,
+        ),
+    )
+    outbox_id = hashlib.sha256(f"{artifact_id}:{revision}:{digest}".encode()).hexdigest()
+    timestamp = created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at)
+    connection.execute(
+        "INSERT INTO artifact_outbox(outbox_id, artifact_id, artifact_revision, target_path, "
+        "state, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', ?, ?) "
+        "ON CONFLICT(outbox_id) DO NOTHING",
+        (outbox_id, artifact_id, revision, str(target_path), timestamp, timestamp),
+    )
+    return outbox_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,10 +165,7 @@ class ArtifactService:
                         request.created_at,
                     ),
                 )
-                self.connection.execute(
-                    "INSERT INTO memory_fts(memory_id, content) VALUES (?, ?)",
-                    (memory.memory_id, memory.value_json),
-                )
+                index_memory(self.connection, memory.memory_id, memory.value_json)
             self.connection.execute(
                 "INSERT INTO artifact_outbox(outbox_id, artifact_id, artifact_revision, target_path, "
                 "state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",

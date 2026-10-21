@@ -193,9 +193,6 @@ class PlanningWorkflow:
             skills,
         )
 
-    def _select_skills(self, lease: RunLease, brief: StoryBrief) -> tuple[ActiveSkillPin, ...] | str:
-        return select_planning_skills(self.catalog, lease, brief)
-
     def _block(self, lease: RunLease, reason_code: str) -> PlanningBlocked:
         self.coordinator.block_planning(lease, reason_code)
         return PlanningBlocked(reason_code)

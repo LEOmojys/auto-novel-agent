@@ -26,6 +26,8 @@ from novel_agent.audit import (
 from novel_agent.contracts import RunCommandType, RunStatus
 from novel_agent.default_stage import default_stage_executor_factory
 from novel_agent.local_run_scheduler import LocalRunScheduler
+from novel_agent.memory_promotion import promote_candidates
+from novel_agent.memory_review import MemoryReviewService
 from novel_agent.pathing import ArtifactId, ProjectId, ProjectPathResolver
 from novel_agent.revision_models import RebaseConfirmation
 from novel_agent.run_coordinator import RunCoordinator
@@ -51,6 +53,20 @@ from novel_agent.service_models import (
 )
 from novel_agent.storage import connect_project_database, migrate
 from novel_agent.workflow_view import WorkflowView, build_workflow_view
+
+
+# Rollback intent (multi-turn console): "去掉/删除/回退刚完成的内容" should
+# discard the latest finished run instead of starting a new one.  Deterministic
+# so a cancel-style instruction never degrades into a fresh full-novel plan.
+_ROLLBACK_ACTION = re.compile(r"(?:去掉|删除|删掉|回退|回滚|撤销|作废|不要了|不要|扔掉|作废掉)")
+_ROLLBACK_TARGET = re.compile(r"(?:刚|刚才|最近|刚完成|这次|本次|刚刚).{0,8}(?:内容|章节|小说|东西|写|产物|成果|剧情)|(?:内容|章节|小说).{0,6}(?:不要|删除|回退|撤销)")
+
+
+def _is_rollback_intent(requirements: str) -> bool:
+    """Whether a console instruction asks to discard previously produced work."""
+    text = requirements.strip()
+    return bool(_ROLLBACK_ACTION.search(text) and _ROLLBACK_TARGET.search(text))
+
 
 if TYPE_CHECKING:
     from novel_agent.provider_types import ProviderTransport
@@ -99,7 +115,9 @@ class NovelAgentService:
                 now=clock,
                 provider_transport=provider_transport,
             )
-        timeout = float(os.environ.get("NOVEL_AGENT_STAGE_TIMEOUT_SECONDS", "30.0"))
+        # Real providers routinely need many minutes per stage; 30s made the
+        # default configuration fail with stage_timeout before the first chapter.
+        timeout = float(os.environ.get("NOVEL_AGENT_STAGE_TIMEOUT_SECONDS", "7200.0"))
         return cls(resolver, now=clock, stage_executor_factory=factory, stage_timeout_seconds=timeout)
 
     def project_ids(self) -> tuple[ProjectId, ...]:
@@ -167,6 +185,7 @@ class NovelAgentService:
 
         The run id is assigned automatically:
         - if the project's latest run is terminal AND its stored requirements
+
           match the submitted ones, that run_id is reused so a retry after a
           failure/cancellation (or a re-run after success) requeues the same
           execution cycle instead of spawning a look-alike;
@@ -180,6 +199,18 @@ class NovelAgentService:
         """
         latest_row: tuple | None
         suffix = 0
+        # Multi-turn rollback intent: "去掉/删除/回退刚完成的内容" discards the
+        # latest finished run instead of allocating a new creative run.
+        if _is_rollback_intent(user_requirements):
+            with self._connection(project_id) as connection:
+                row = connection.execute(
+                    "SELECT run_id FROM runs WHERE project_id = ? AND state = ? "
+                    "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    (project_id.root, RunStatus.SUCCEEDED.value),
+                ).fetchone()
+            if row is None:
+                raise RunTransitionError("latest", "no_successful_run", "rollback")
+            return self.rollback_run(project_id, str(row[0]))
         with self._connection(project_id) as connection:
             latest_row = connection.execute(
                 "SELECT r.run_id, r.state, c.payload_json FROM runs r "
@@ -482,6 +513,40 @@ class NovelAgentService:
         self._enqueue_from_start_command(request.project_id, request.run_id)
         return snapshot
 
+    def list_memory_candidates(
+        self,
+        project_id: ProjectId,
+        *,
+        statuses: tuple[str, ...] | None = None,
+        run_id: str | None = None,
+    ) -> list[dict]:
+        """Reviewable memory candidates (needs_review/conflicted/quarantined)."""
+        with self._connection(project_id) as connection:
+            views = MemoryReviewService(connection, self._now).list(
+                project_id.root, statuses=statuses, run_id=run_id
+            )
+        return [view.as_dict() for view in views]
+
+    def resolve_memory_candidate(
+        self,
+        project_id: ProjectId,
+        candidate_id: str,
+        *,
+        decision: str,
+        actor: str = "console",
+        reason: str = "",
+    ) -> dict:
+        """Accept (promote) or reject a memory candidate; decisions are audited."""
+        with self._connection(project_id) as connection:
+            resolution = MemoryReviewService(connection, self._now).resolve(
+                candidate_id,
+                project_id=project_id.root,
+                decision=decision,
+                actor=actor,
+                reason=reason,
+            )
+        return resolution.as_dict()
+
     def approve_plan(self, project_id: ProjectId, run_id: str, idempotency_key: str) -> RunUiSnapshot:
         """Confirm the generated plan and requeue the run to execute it.
 
@@ -646,6 +711,191 @@ class NovelAgentService:
                 raise RebaseWorkerUnavailableError(request.run_id)
             coordinator.confirm_chapter_rebase(lease, request)
             return self._snapshot(connection, request.project_id, request.run_id, None, False)
+
+    def rollback_run(self, project_id: ProjectId, run_id: str) -> RunUiSnapshot:
+        """Roll back a finished run: hard-delete the artifacts, memory and
+        exported files it produced, restoring the asset snapshot from before it.
+
+        The project is returned to the state it had when ``run_id`` started:
+        - artifacts created by this run are physically removed (world / cast /
+          outline / chapters); for a shared artifact id whose current pointer
+          was advanced by this run, the pointer falls back to the latest
+          accepted revision from an earlier run;
+        - memory records/candidates produced by this run are deleted;
+        - exported ``worlds/`` / ``characters/`` / ``novel/`` files produced by
+          this run are removed;
+        - the run itself is marked ``cancelled`` so it no longer claims a
+          terminal success, and its events remain as an audit trail.
+
+        All writes happen in a single transaction (rollback-safe).  The
+        run's revision history of OTHER runs is never touched.
+        """
+        from novel_agent.run_event_store import append_run_event as _append_event
+
+        with self._connection(project_id) as connection:
+            self._require_run_project(connection, project_id, run_id)
+            row = connection.execute(
+                "SELECT state, created_at FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise RunTransitionError(run_id, "missing", "rollback")
+            state = RunStatus(str(row[0]))
+            if state is not RunStatus.SUCCEEDED:
+                raise RunTransitionError(run_id, state.value, "rollback")
+            run_created_at = str(row[1])
+
+            # 1) Artifacts produced by this run.
+            rows = connection.execute(
+                "SELECT artifact_id, revision, kind, is_current, sha256 FROM artifacts "
+                "WHERE run_id = ? AND status = 'accepted'",
+                (run_id,),
+            ).fetchall()
+            artifact_ids: set[str] = set()
+            removed_hashes: set[str] = set()
+            for artifact_id, revision, kind, is_current, sha256 in rows:
+                artifact_ids.add(str(artifact_id))
+                if sha256:
+                    removed_hashes.add(str(sha256))
+                if is_current:
+                    # This run advanced the current pointer: fall back to the
+                    # latest accepted revision from an earlier run.  Revisions
+                    # are globally increasing per artifact_id (each commit
+                    # takes MAX+1), so revision order is the reliable "before
+                    # this run" signal, independent of created_at.
+                    prev = connection.execute(
+                        "SELECT artifact_id, revision FROM artifacts "
+                        "WHERE artifact_id = ? AND status = 'accepted' AND run_id <> ? "
+                        "ORDER BY revision DESC LIMIT 1",
+                        (str(artifact_id), run_id),
+                    ).fetchone()
+                    if prev is not None:
+                        connection.execute(
+                            "UPDATE artifacts SET is_current = 0 WHERE artifact_id = ? AND is_current = 1",
+                            (str(artifact_id),),
+                        )
+                        connection.execute(
+                            "UPDATE artifacts SET is_current = 1 WHERE artifact_id = ? AND revision = ?",
+                            (str(prev[0]), int(prev[1])),
+                        )
+                    else:
+                        # No earlier accepted version: drop the current pointer.
+                        connection.execute(
+                            "UPDATE artifacts SET is_current = 0 WHERE artifact_id = ? AND is_current = 1",
+                            (str(artifact_id),),
+                        )
+            for artifact_id in artifact_ids:
+                connection.execute(
+                    "DELETE FROM artifact_dependencies WHERE artifact_id = ? OR depends_on_artifact_id = ?",
+                    (artifact_id, artifact_id),
+                )
+                connection.execute(
+                    "DELETE FROM artifact_outbox WHERE artifact_id = ?",
+                    (artifact_id,),
+                )
+                connection.execute(
+                    "DELETE FROM quality_reports WHERE artifact_id = ?",
+                    (artifact_id,),
+                )
+                connection.execute(
+                    "DELETE FROM chapter_branch_members WHERE artifact_id = ?",
+                    (artifact_id,),
+                )
+            # 1b) Memory produced by this run (child tables first so FKs hold;
+            # memory rows reference artifacts via source_artifact_id, so this
+            # must run before deleting the artifacts).  `memory_edges` has no
+            # run_id column: reference it through the run's memory ids so the
+            # FTS rows and RESTRICT foreign keys stay consistent.
+            memory_ids = [
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT memory_id FROM memory_records WHERE run_id = ?", (run_id,)
+                ).fetchall()
+            ]
+            if memory_ids:
+                placeholders = ", ".join("?" for _ in memory_ids)
+                # Later runs may supersede this run's facts; clear the pointer
+                # before deleting so the RESTRICT foreign key does not abort
+                # the rollback.
+                connection.execute(
+                    f"UPDATE memory_records SET supersedes_id = NULL "
+                    f"WHERE supersedes_id IN ({placeholders})",
+                    tuple(memory_ids),
+                )
+            for identifier in memory_ids:
+                connection.execute(
+                    "DELETE FROM memory_edges WHERE source_memory_id = ? OR target_memory_id = ?",
+                    (identifier, identifier),
+                )
+                connection.execute("DELETE FROM memory_fts WHERE memory_id = ?", (identifier,))
+            connection.execute("DELETE FROM context_packs WHERE run_id = ?", (run_id,))
+            for table in ("memory_conflicts", "memory_candidates", "memory_records"):
+                try:
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE run_id = ?", (run_id,)
+                    )
+                except sqlite3.OperationalError:
+                    pass
+            connection.execute(
+                "DELETE FROM artifacts WHERE run_id = ?", (run_id,)
+            )
+
+            # 1c) Any leftover quality reports tied to this run's task.
+            try:
+                connection.execute(
+                    "DELETE FROM quality_reports WHERE run_id = ?", (run_id,)
+                )
+            except sqlite3.OperationalError:
+                pass
+
+            # 3) Exported files produced by this run.
+            try:
+                self._remove_run_exported_files(project_id, removed_hashes)
+            except Exception:  # noqa: BROAD_EXCEPT_OK - export cleanup is best-effort
+                pass
+
+            # 4) The run is no longer a success; keep its audit trail.
+            connection.execute(
+                "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
+                (RunStatus.CANCELLED.value, self._now().isoformat(), run_id),
+            )
+            _append_event(
+                connection,
+                RunEvent(run_id, "run_cancelled", {"reason": "rollback"}, self._now()),
+            )
+            return self._snapshot(connection, project_id, run_id, None, False)
+
+    def _remove_run_exported_files(
+        self,
+        project_id: ProjectId,
+        removed_hashes: set[str],
+    ) -> None:
+        """Best-effort removal of exported files tied to a rolled-back run.
+
+        Export writes ``worlds/*.txt``, ``characters/*.json`` and
+        ``novel/*.json``.  Only files whose content hash matches a removed
+        artifact are deleted; the authoritative SQLite state (already rolled
+        back) is what governs reuse, so any leftover file is cosmetic and gets
+        overwritten on the next run.
+        """
+        project_dir = self._path_resolver.resolve_project(project_id)
+        if not removed_hashes:
+            return
+        import hashlib as _hashlib
+
+        for sub in ("worlds", "characters", "novel"):
+            directory = project_dir / sub
+            if not directory.is_dir():
+                continue
+            for path in list(directory.glob("*")):
+                try:
+                    data = path.read_bytes()
+                except OSError:
+                    continue
+                if _hashlib.sha256(data).hexdigest() in removed_hashes:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
 
     @contextmanager
     def _connection(self, project_id: ProjectId) -> Iterator[sqlite3.Connection]:
@@ -854,12 +1104,8 @@ def _approve_chapter(
     """
     import hashlib as _hashlib
 
-    from novel_agent.chapter_commit_models import ChapterCommitContext
     from novel_agent.chapter_models import StagedChapter
     from novel_agent.contracts import PlanContract
-    from novel_agent.memory_models import MemoryCandidateRecord
-    from novel_agent.memory_policy import decide_promotion
-    from novel_agent.memory_store import build_evidence, load_source, memory_id, record_status
     from novel_agent.pathing import ArtifactId
 
     row = connection.execute(
@@ -940,91 +1186,23 @@ def _approve_chapter(
         "UPDATE artifacts SET is_current = 0 WHERE artifact_id = ? AND revision <> ?",
         (artifact_id, revision),
     )
-    # Promote staged memory candidates to the confirmed M3 layer.
-    context = ChapterCommitContext(
+    # Promote staged memory candidates through the shared policy path.  The
+    # console approval is an explicit user decision about the CHAPTER, so a
+    # candidate the policy still wants reviewed stays in review instead of
+    # blocking the approval itself.
+    promote_candidates(
         connection,
-        ProjectPathResolver.from_config(),
-        committed_at,
-        fencing_token=_current_fence(connection, run_id),
+        run_id=run_id,
+        artifact_id=artifact_id,
+        artifact_revision=revision,
+        chapter_number=chapter.chapter_number,
+        committed_at=committed_at,
+        created_by="chapter-approval:v1",
     )
-    candidates = connection.execute(
-        "SELECT candidate_id, candidate_json FROM memory_candidates WHERE run_id = ? "
-        "AND source_artifact_id = ? AND source_artifact_revision = ? ORDER BY candidate_id",
-        (run_id, artifact_id, revision),
-    ).fetchall()
-    for candidate_id, candidate_json in candidates:
-        candidate = MemoryCandidateRecord.model_validate_json(str(candidate_json))
-        evidence = build_evidence(candidate.evidence.proposal, load_source(connection, candidate.evidence.proposal))
-        outcome = decide_promotion(evidence, _has_memory_conflict(connection, evidence))
-        if outcome.outcome.value != "promoted":
-            connection.execute(
-                "UPDATE memory_candidates SET status = ? WHERE candidate_id = ?",
-                (outcome.candidate_status.value, candidate_id),
-            )
-            continue
-        proposal = evidence.proposal
-        identifier = memory_id(candidate_id)
-        connection.execute(
-            "INSERT INTO memory_records(memory_id, project_id, run_id, plan_revision, layer, kind, status, "
-            "subject_id, predicate, value_json, chapter_start, chapter_end, source_artifact_id, "
-            "source_artifact_revision, source_span, source_hash, confidence, created_by, created_at, supersedes_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                identifier,
-                proposal.project_id.root,
-                proposal.run_id,
-                proposal.plan_revision,
-                proposal.target_layer.value,
-                proposal.kind.value,
-                record_status(proposal.target_layer),
-                proposal.subject_id,
-                proposal.predicate,
-                proposal.value_json,
-                chapter.chapter_number,
-                chapter.chapter_number,
-                proposal.source_artifact_id.root,
-                proposal.source_artifact_revision,
-                f"{evidence.source_byte_start}:{evidence.source_byte_end}",
-                evidence.source_span_sha256,
-                proposal.confidence,
-                "chapter-approval:v1",
-                committed_at.isoformat(),
-                proposal.supersedes_memory_id,
-            ),
-        )
-        connection.execute(
-            "INSERT INTO memory_fts(memory_id, content) VALUES (?, ?)",
-            (identifier, proposal.value_json),
-        )
-        connection.execute(
-            "UPDATE memory_candidates SET status = 'promoted' WHERE candidate_id = ?",
-            (candidate_id,),
-        )
     connection.execute(
         "UPDATE tasks SET state = 'succeeded', updated_at = ? WHERE task_id = ? AND run_id = ?",
         (committed_at.isoformat(), task_id, run_id),
     )
-
-
-def _has_memory_conflict(connection: sqlite3.Connection, evidence) -> bool:
-    proposal = evidence.proposal
-    if proposal.subject_id is None:
-        return False
-    rows = connection.execute(
-        "SELECT value_json FROM memory_records current WHERE project_id = ? AND layer = ? "
-        "AND subject_id = ? AND predicate = ? AND NOT EXISTS (SELECT 1 FROM memory_records "
-        "successor WHERE successor.supersedes_id = current.memory_id)",
-        (proposal.project_id.root, proposal.target_layer.value, proposal.subject_id, proposal.predicate),
-    ).fetchall()
-    return any(str(row[0]) != proposal.value_json for row in rows)
-
-
-def _current_fence(connection: sqlite3.Connection, run_id: str) -> int:
-    row = connection.execute(
-        "SELECT fencing_token FROM run_leases WHERE run_id = ? ORDER BY fencing_token DESC LIMIT 1",
-        (run_id,),
-    ).fetchone()
-    return int(row[0]) if row is not None else 1
 
 
 def _clear_tool_ledger_for_regenerate(
@@ -1070,7 +1248,24 @@ def _is_final_graph_output(
     }
     node_name = kind_to_node.get(kind)
     if kind == "chapter":
-        node_name = None  # chapters are always the tail when present
+        # In agent_loop runs a chapter is only the final output when no plan
+        # steps remain; approving an intermediate chapter must requeue the run
+        # so the remaining plan steps (e.g. a second chapter) still execute.
+        try:
+            row = connection.execute(
+                "SELECT remaining_plan_json FROM loop_state WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # DAG runs have no loop_state table; chapters are always final.
+            return True
+        if row is not None and row[0]:
+            try:
+                remaining = json.loads(str(row[0]))
+            except (json.JSONDecodeError, TypeError):
+                remaining = []
+            if remaining:
+                return False
         return True
     if node_name is None:
         return False

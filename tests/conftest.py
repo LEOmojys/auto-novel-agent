@@ -65,6 +65,16 @@ def isolated_project(monkeypatch: pytest.MonkeyPatch, temporary_project: Tempora
 
 
 @pytest.fixture(autouse=True)
+def deterministic_continuity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the LLM continuity auditor out of the deterministic test suite.
+
+    Production defaults to the provider-backed auditor; dedicated tests opt in
+    with `monkeypatch.setenv("NOVEL_AGENT_CONTINUITY_AUDIT", "llm")`.
+    """
+    monkeypatch.setenv("NOVEL_AGENT_CONTINUITY_AUDIT", "offline")
+
+
+@pytest.fixture(autouse=True)
 def block_outbound_http(monkeypatch: pytest.MonkeyPatch) -> None:
     def forbid_request(
         _session: requests.Session,

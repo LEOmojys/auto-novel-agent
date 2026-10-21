@@ -81,7 +81,7 @@ def _has_valid_authority(
     match layer:
         case MemoryLayer.M1_CANONICAL:
             match authority:
-                case PromotionAuthority.VALIDATED_WORLD:
+                case PromotionAuthority.VALIDATED_WORLD | PromotionAuthority.USER_REVIEW:
                     return supersedes_memory_id is None
                 case PromotionAuthority.USER_RETCON:
                     return supersedes_memory_id is not None
@@ -91,11 +91,12 @@ def _has_valid_authority(
                     assert_never(unreachable)
         case MemoryLayer.M2_PLAN:
             match authority:
-                case PromotionAuthority.VALIDATED_PLAN:
+                case PromotionAuthority.VALIDATED_PLAN | PromotionAuthority.USER_REVIEW:
                     return supersedes_memory_id is None
+                case PromotionAuthority.USER_RETCON:
+                    return supersedes_memory_id is not None
                 case (
                     PromotionAuthority.VALIDATED_WORLD
-                    | PromotionAuthority.USER_RETCON
                     | PromotionAuthority.ACCEPTED_CHAPTER
                 ):
                     return False
@@ -103,11 +104,12 @@ def _has_valid_authority(
                     assert_never(unreachable)
         case MemoryLayer.M3_CONFIRMED:
             match authority:
-                case PromotionAuthority.ACCEPTED_CHAPTER:
+                case PromotionAuthority.ACCEPTED_CHAPTER | PromotionAuthority.USER_REVIEW:
                     return supersedes_memory_id is None
+                case PromotionAuthority.USER_RETCON:
+                    return supersedes_memory_id is not None
                 case (
                     PromotionAuthority.VALIDATED_WORLD
-                    | PromotionAuthority.USER_RETCON
                     | PromotionAuthority.VALIDATED_PLAN
                 ):
                     return False
@@ -117,6 +119,11 @@ def _has_valid_authority(
             return False
         case unreachable:
             assert_never(unreachable)
+
+
+def memory_kind_allowed(layer: MemoryLayer, kind: MemoryFactKind) -> bool:
+    """Whether `kind` may live in `layer` (used by manual review promotion)."""
+    return _fact_code(layer, kind) is None
 
 
 def _fact_code(layer: MemoryLayer, kind: MemoryFactKind) -> ReviewCode | None:
@@ -230,10 +237,11 @@ def _is_explicit_retcon(evidence: CandidateEvidence) -> bool:
             PromotionAuthority.VALIDATED_WORLD
             | PromotionAuthority.VALIDATED_PLAN
             | PromotionAuthority.ACCEPTED_CHAPTER
+            | PromotionAuthority.USER_REVIEW
         ):
             return False
         case unreachable:
             assert_never(unreachable)
 
 
-__all__ = ("PromotionDecision", "decide_promotion")
+__all__ = ("PromotionDecision", "decide_promotion", "memory_kind_allowed")

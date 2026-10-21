@@ -35,7 +35,7 @@ function nodeLabel(nodeId) {
 }
 
 const state = {
-  project: "", run_id: "", provider: "offline_fake",
+  project: "", run_id: "", provider: "legacy_real",
   events_seen: -1, artifacts_loaded: false,
   polling: null, chain_version: 0, chain_event_seen: -1,
   pending_key: "", pending_artifact: null, pending_original: "", pending_loaded: false,
@@ -247,6 +247,26 @@ async function control(command) {
   }
 }
 
+async function rollbackRun() {
+  if (!state.run_id) {
+    setBadge("err", "没有可回滚的运行");
+    return;
+  }
+  if (!confirm(`确定回滚运行 ${state.run_id}？\n将删除该运行产出的所有内容（章节/角色/大纲等），并恢复到它开始之前的状态。此操作不可撤销。`)) {
+    return;
+  }
+  try {
+    const data = await post("/api/run/rollback", {
+      project: state.project, run_id: state.run_id,
+    });
+    renderSnapshot(data);
+    await loadHistory();
+    setBadge("ok", `已回滚 ${state.run_id}`);
+  } catch (error) {
+    setBadge("err", error.message);
+  }
+}
+
 async function confirmRebase() {
   try {
     const data = await post("/api/run/rebase", {
@@ -334,6 +354,68 @@ function clearPendingState() {
   state.pending_loaded = false;
 }
 
+// ---------- 记忆审阅 ----------
+
+let memoryLoadedAt = 0;
+
+async function loadMemoryCandidates(force = false) {
+  const list = $("memory-candidates");
+  if (!list) return;
+  if (!state.project) { list.innerHTML = ""; return; }
+  if (!force && Date.now() - memoryLoadedAt < 5000) return;
+  memoryLoadedAt = Date.now();
+  try {
+    const data = await api(`/api/memory/candidates?project=${encodeURIComponent(state.project)}`);
+    const items = data.candidates || [];
+    list.innerHTML = "";
+    if (!items.length) {
+      list.innerHTML = '<div class="task-empty">暂无待审记忆候选</div>';
+      return;
+    }
+    for (const item of items) {
+      const row = document.createElement("div");
+      row.className = "memory-item";
+      const title = document.createElement("div");
+      title.className = "memory-title";
+      title.textContent = `[${item.status}] ${item.kind} · ${item.subject_id} · ${item.predicate}`;
+      const meta = document.createElement("div");
+      meta.className = "memory-meta";
+      meta.textContent = `第${item.chapter_number ?? "-"}章 · 置信度 ${item.confidence} · ${String(item.value_json).slice(0, 80)}`;
+      const actions = document.createElement("div");
+      actions.className = "memory-actions";
+      const accept = document.createElement("button");
+      accept.className = "primary";
+      accept.textContent = "接受";
+      accept.addEventListener("click", () => resolveMemoryCandidate(item.candidate_id, "accept"));
+      const reject = document.createElement("button");
+      reject.textContent = "拒绝";
+      reject.addEventListener("click", () => resolveMemoryCandidate(item.candidate_id, "reject"));
+      actions.append(accept, reject);
+      row.append(title, meta, actions);
+      list.append(row);
+    }
+  } catch (error) {
+    list.innerHTML = `<div class="task-empty">记忆候选加载失败：${error.message}</div>`;
+  }
+}
+
+async function resolveMemoryCandidate(candidateId, decision) {
+  let reason = "";
+  if (decision === "reject") {
+    reason = window.prompt("拒绝原因（可选）") || "";
+  }
+  try {
+    await post("/api/memory/resolve", {
+      project: state.project,
+      candidate_id: candidateId,
+      decision,
+      reason,
+    });
+  } finally {
+    await loadMemoryCandidates(true);
+  }
+}
+
 // ---------- 轮询 ----------
 
 function startPolling() {
@@ -373,6 +455,7 @@ function renderInFlightCall(events) {
 }
 
 async function refresh() {
+  loadMemoryCandidates();
   if (!state.run_id) return;
   try {
     const snapshot = await api(`/api/run/snapshot?project=${encodeURIComponent(state.project)}&run_id=${encodeURIComponent(state.run_id)}`);
@@ -416,6 +499,8 @@ function renderSnapshot(snapshot) {
   $("pause-btn").disabled = snapshot.status !== "running";
   $("resume-btn").disabled = snapshot.status !== "paused";
   $("cancel-btn").disabled = !["queued", "running", "paused", "waiting_review"].includes(snapshot.status);
+  // Rollback is only meaningful for a finished (successful) run.
+  $("rollback-btn").disabled = snapshot.status !== "succeeded";
   $("repair-btn").disabled = !(snapshot.status === "waiting_review" && snapshot.review_reason && snapshot.review_reason !== "chapter_rebase_confirmation_required");
   const rebaseRequired = snapshot.status === "waiting_review" && snapshot.review_reason === "chapter_rebase_confirmation_required";
   $("rebase-panel").style.display = rebaseRequired ? "block" : "none";
@@ -790,6 +875,7 @@ $("new-project").addEventListener("keydown", (event) => {
 $("pause-btn").addEventListener("click", () => control("pause"));
 $("resume-btn").addEventListener("click", () => control("resume"));
 $("cancel-btn").addEventListener("click", () => control("cancel"));
+$("rollback-btn").addEventListener("click", rollbackRun);
 $("repair-btn").addEventListener("click", () => control("repair"));
 $("rewrite-btn").addEventListener("click", rewriteChapter);
 $("refresh-btn").addEventListener("click", refresh);
@@ -799,7 +885,13 @@ $("approve-btn").addEventListener("click", approveArtifact);
 $("regenerate-btn").addEventListener("click", regenerateArtifact);
 $("plan-approve-btn").addEventListener("click", approvePlan);
 $("plan-regen-btn").addEventListener("click", regeneratePlan);
-$("project-select").addEventListener("change", () => { state.project = $("project-select").value; });
+$("project-select").addEventListener("change", () => {
+  state.project = $("project-select").value;
+  state.run_id = "";
+  clearRunView();
+  loadHistory();
+  loadMemoryCandidates(true);
+});
 
 loadProjects().catch((error) => setBadge("err", error.message));
 checkProvider();

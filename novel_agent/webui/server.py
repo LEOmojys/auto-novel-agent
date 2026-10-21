@@ -30,6 +30,7 @@ from novel_agent.service import (
 )
 
 _STATIC_ROOT: Final[Path] = Path(__file__).with_name("static")
+_MAX_REQUEST_BYTES: Final[int] = 2 * 1024 * 1024  # JSON control-plane payloads only
 _MIME: Final[dict[str, str]] = {
     ".html": "text/html; charset=utf-8",
     ".js": "application/javascript; charset=utf-8",
@@ -113,6 +114,8 @@ class AgentConsoleHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
             return {}
+        if length > _MAX_REQUEST_BYTES:
+            raise ValueError("request body too large")
         try:
             return json.loads(self.rfile.read(length).decode("utf-8"))
         except json.JSONDecodeError:
@@ -143,6 +146,8 @@ class AgentConsoleHandler(BaseHTTPRequestHandler):
             return self._json(self._artifact_payload(query))
         if path == "/api/run/audit":
             return self._json(self._audit_payload(query))
+        if path == "/api/memory/candidates":
+            return self._json(self._memory_candidates_payload(query))
         if path == "/api/run/events":
             return self._json(self._events_payload(query))
         return self._json({"error": f"unknown route: {path}"}, 404)
@@ -169,11 +174,16 @@ class AgentConsoleHandler(BaseHTTPRequestHandler):
             return self._json(self._plan_approve_payload(body))
         if url.path == "/api/run/plan/regenerate":
             return self._json(self._plan_regenerate_payload(body))
+        if url.path == "/api/memory/resolve":
+            return self._json(self._memory_resolve_payload(body))
+        if url.path == "/api/run/rollback":
+            return self._json(self._rollback_payload(body))
         return self._json({"error": f"unknown route: {url.path}"}, 404)
 
     def _static(self, name: str) -> None:
-        target = (_STATIC_ROOT / name).resolve()
-        if not str(target).startswith(str(_STATIC_ROOT.resolve())) or not target.is_file():
+        root = _STATIC_ROOT.resolve()
+        target = (root / name).resolve()
+        if not target.is_relative_to(root) or not target.is_file():
             return self._json({"error": "not found"}, 404)
         mime = _MIME.get(target.suffix, "application/octet-stream")
         self._send(200, mime, target.read_bytes())
@@ -413,7 +423,7 @@ class AgentConsoleHandler(BaseHTTPRequestHandler):
                     run_id=run_id,
                     idempotency_key=f"webui-start:{run_id}:{hashlib.sha256(requirements.encode()).hexdigest()[:12]}",
                     user_requirements=requirements,
-                    provider=str(body.get("provider", "offline_fake")),
+                    provider=str(body.get("provider", "legacy_real")),
                     target_chapter_count=int(body["chapter_count"]) if body.get("chapter_count") else None,
                     auto_approve=bool(body.get("auto_approve", True)),
                 )
@@ -424,7 +434,7 @@ class AgentConsoleHandler(BaseHTTPRequestHandler):
             snapshot = self.server.service.start_auto(
                 project_id,
                 requirements,
-                provider=str(body.get("provider", "offline_fake")),
+                provider=str(body.get("provider", "legacy_real")),
                 target_chapter_count=int(body["chapter_count"]) if body.get("chapter_count") else None,
                 auto_approve=bool(body.get("auto_approve", True)),
             )
@@ -453,6 +463,38 @@ class AgentConsoleHandler(BaseHTTPRequestHandler):
             )
         return _snapshot_dict(snapshot)
 
+    def _rollback_payload(self, body: dict) -> dict:
+        project = ProjectId(str(body["project"]))
+        run_id = str(body["run_id"])
+        snapshot = self.server.service.rollback_run(project, run_id)
+        return _snapshot_dict(snapshot)
+
+
+    def _memory_candidates_payload(self, query: dict) -> dict:
+        project = ProjectId(str(query.get("project", "default")))
+        run_id = str(query["run_id"]) if query.get("run_id") else None
+        raw_status = str(query.get("status", "") or "")
+        statuses = tuple(part for part in raw_status.split(",") if part) or None
+        return {
+            "candidates": self.server.service.list_memory_candidates(
+                project, statuses=statuses, run_id=run_id
+            )
+        }
+
+    def _memory_resolve_payload(self, body: dict) -> dict:
+        project = ProjectId(str(body.get("project", "default")))
+        candidate_id = str(body.get("candidate_id", "") or "")
+        decision = str(body.get("decision", "") or "")
+        if not candidate_id or decision not in {"accept", "reject"}:
+            raise ValueError("candidate_id and decision(accept|reject) are required")
+        resolution = self.server.service.resolve_memory_candidate(
+            project,
+            candidate_id,
+            decision=decision,
+            actor=str(body.get("actor", "") or "console"),
+            reason=str(body.get("reason", "") or ""),
+        )
+        return {"resolution": resolution}
 
 def _provider_health(call=None) -> dict:
     """Live LLM connectivity probe: key presence + one minimal real call.

@@ -184,6 +184,12 @@ def test_loop_emits_plan_event_and_executes_first_step() -> None:
 
 
 def test_loop_plan_replacement_skips_replaced_steps() -> None:
+    """A replacement plan after the first plan finished is a fresh plan.
+
+    The loop auto-executes the whole plan, so a second plan is not a
+    "replacement of remaining steps" but a follow-up plan (opencode-style:
+    plans run to completion, then the model decides what to do next).
+    """
     called: list[str] = []
     tools = {name: _recorder_tool(name, called) for name in ("a", "b", "c")}
     loop = AgentLoop(
@@ -198,8 +204,57 @@ def test_loop_plan_replacement_skips_replaced_steps() -> None:
     )
     outcome, _history = loop.run(system_prompt="sys", task="任务")
     assert outcome == "done"
-    # The replacement plan drops the remaining "b" step; "c" runs instead.
-    assert called == ["a", "c"]
+    # Both plans run to completion in order (auto-advance), then done.
+    assert called == ["a", "b", "c"]
+
+
+def test_loop_auto_advances_entire_plan() -> None:
+    """The loop executes every plan step automatically without model turns."""
+    called: list[str] = []
+    tools = {name: _recorder_tool(name, called) for name in ("a", "b", "c")}
+    loop = AgentLoop(
+        tools=tools,
+        transport=_SeqTransport([
+            '{"plan": [{"tool": "a", "args": {}}, {"tool": "b", "args": {}}, {"tool": "c", "args": {}}]}',
+            '{"done": true}',
+        ]),
+        now=lambda: FIXED_TIME,
+        config=LoopConfig(max_steps=10),
+    )
+    outcome, history = loop.run(system_prompt="sys", task="任务")
+    assert outcome == "done"
+    # All three steps ran with a single plan; the model only saw the result.
+    assert called == ["a", "b", "c"]
+    assert sum(1 for m in history if m.role == "tool") == 3
+
+
+def test_loop_pauses_auto_advance_on_failed_step() -> None:
+    """A failed plan step stops the auto-advance for the model to decide."""
+    called: list[str] = []
+
+    def execute(_args: dict) -> ToolResult:
+        called.append("b")
+        return ToolResult(ok=False, error="b 失败了")
+
+    tools = {
+        "a": _recorder_tool("a", called),
+        "b": AgentTool(name="b", description="b", input_schema={}, execute=execute),
+        "c": _recorder_tool("c", called),
+    }
+    loop = AgentLoop(
+        tools=tools,
+        transport=_SeqTransport([
+            '{"plan": [{"tool": "a", "args": {}}, {"tool": "b", "args": {}}, {"tool": "c", "args": {}}]}',
+            '{"plan": [{"tool": "c", "args": {}}]}',
+            '{"done": true}',
+        ]),
+        now=lambda: FIXED_TIME,
+        config=LoopConfig(max_steps=10),
+    )
+    outcome, _history = loop.run(system_prompt="sys", task="任务")
+    assert outcome == "done"
+    # "b" failed -> auto-advance stopped before "c"; the model replanned "c".
+    assert called == ["a", "b", "c"]
 
 
 def test_loop_next_without_plan_guides_model() -> None:
@@ -228,7 +283,12 @@ def projects_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 class _LoopDecisionTransport:
-    """Scripted Plan-Act model: plan (world..chapter) -> re-plan remaining -> done."""
+    """Scripted Plan-Act model: plan (world..chapter) -> re-plan remaining -> done.
+
+    With auto-advance, each plan runs to the first approval gate, then the
+    resumed run replans the remaining steps.  This script matches the
+    approval-chain E2E (auto_approve=False): plan(4) -> plan(3) -> ... -> done.
+    """
 
     def __init__(self) -> None:
         self.actions = [
@@ -238,6 +298,27 @@ class _LoopDecisionTransport:
             '{"tool": "write_chapter", "args": {"chapter_number": 1}}]}',
             '{"plan": [{"tool": "write_outline", "args": {}}, {"tool": "write_chapter", "args": {"chapter_number": 1}}]}',
             '{"plan": [{"tool": "write_chapter", "args": {"chapter_number": 1}}]}',
+            '{"done": true, "reply": "完成"}',
+        ]
+        self.calls = 0
+
+    def generate(self, request) -> ProviderTransportResult:
+        content = self.actions[min(self.calls, len(self.actions) - 1)]
+        self.calls += 1
+        return ProviderTransportResult(content=content, model_name="t", prompt_tokens=1, completion_tokens=1)
+
+
+class _LoopFullPlanTransport:
+    """Scripted Plan-Act model: one full plan (world..chapter) then done.
+
+    With auto-advance and auto_approve=True, a single plan runs every step to
+    completion, so the model only confirms completion afterwards.
+    """
+
+    def __init__(self) -> None:
+        self.actions = [
+            '{"plan": [{"tool": "write_world", "args": {}}, {"tool": "write_cast", "args": {}}, '
+            '{"tool": "write_outline", "args": {}}, {"tool": "write_chapter", "args": {"chapter_number": 1}}]}',
             '{"done": true, "reply": "完成"}',
         ]
         self.calls = 0
@@ -289,7 +370,7 @@ def test_agent_loop_provider_full_pipeline(projects_root: Path) -> None:
         stage = _AgentLoopStage(
             coordinator, req, ProjectPathResolver(projects_root.parent), lambda: FIXED_TIME,
             transport=_LoopBriefTransport(),
-            loop_transport=_LoopDecisionTransport(),
+            loop_transport=_LoopFullPlanTransport(),
             offline_generators=True,
         )
         worker = RunWorker(coordinator, stage, stage_timeout_seconds=30.0)
@@ -530,5 +611,487 @@ def test_agent_loop_outline_only_not_guarded_by_premature_done(projects_root: Pa
         # outline-only should not fail with done_without_chapters even if the
         # loop stops without writing a chapter.
         assert state[0] in (RunStatus.SUCCEEDED.value, RunStatus.WAITING_REVIEW.value)
+    finally:
+        database.__exit__(None, None, None)
+
+
+class _MultiChapterTransport:
+    """Scripted Plan-Act: one plan (optionally with world/cast/outline) writing
+    N chapters, then done."""
+
+    def __init__(self, *chapter_numbers: int, with_prereqs: bool = False) -> None:
+        prereqs = (
+            '{"tool": "write_world", "args": {}}, {"tool": "write_cast", "args": {}}, '
+            '{"tool": "write_outline", "args": {}}, '
+            if with_prereqs else ""
+        )
+        steps = "".join(
+            f'{{"tool": "write_chapter", "args": {{"chapter_number": {n}}}}}' + (", " if i < len(chapter_numbers) - 1 else "")
+            for i, n in enumerate(chapter_numbers)
+        )
+        self.actions = [
+            '{"plan": [' + prereqs + steps + ']}',
+            '{"done": true, "reply": "完成"}',
+        ]
+        self.calls = 0
+
+    def generate(self, request) -> ProviderTransportResult:
+        content = self.actions[min(self.calls, len(self.actions) - 1)]
+        self.calls += 1
+        return ProviderTransportResult(content=content, model_name="t", prompt_tokens=1, completion_tokens=1)
+
+
+def test_agent_loop_continuation_mirrors_existing_plan(projects_root: Path) -> None:
+    """A continuation run reusing a previous run's outline mirrors the plan into
+    the current run so chapter staging passes (regression: ChapterPersistenceError)."""
+    from novel_agent.default_stage import _AgentLoopStage
+    from novel_agent.pathing import ProjectPathResolver
+    from novel_agent.run_coordinator import RunCoordinator
+    from novel_agent.run_models import StartRunRequest
+    from novel_agent.run_worker import RunWorker
+    from novel_agent.service_models import StartNovelRunRequest as S
+
+    database = connect_project_database(projects_root / PROJECT_ID.root)
+    connection = database.__enter__()
+    try:
+        from novel_agent.storage import migrate
+
+        migrate(connection)
+        coordinator = RunCoordinator(connection, lambda: FIXED_TIME)
+        resolver = ProjectPathResolver(projects_root.parent)
+
+        # First run: full novel producing world/cast/outline + chapters 1..3.
+        first = S(project_id=PROJECT_ID, run_id="cont-1", idempotency_key="cont-1",
+                  user_requirements="写一本三章的小说", provider="agent_loop", auto_approve=True)
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="cont-1", idempotency_key="cont-1"))
+        stage1 = _AgentLoopStage(
+            coordinator, first, resolver, lambda: FIXED_TIME,
+            transport=_LoopBriefTransport(chapter_count=5),
+            loop_transport=_MultiChapterTransport(1, 2, 3, with_prereqs=True),
+            offline_generators=True,
+        )
+        RunWorker(coordinator, stage1, stage_timeout_seconds=30.0).run(coordinator.claim_next("worker-1"))
+        assert connection.execute("SELECT state FROM runs WHERE run_id='cont-1'").fetchone() == (RunStatus.SUCCEEDED.value,)
+
+        # Second run: continuation reusing the existing outline (chapters 4-5).
+        second = S(project_id=PROJECT_ID, run_id="cont-2", idempotency_key="cont-2",
+                   user_requirements="续写第4章和第5章", provider="agent_loop", auto_approve=True)
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="cont-2", idempotency_key="cont-2"))
+        stage2 = _AgentLoopStage(
+            coordinator, second, resolver, lambda: FIXED_TIME,
+            transport=_LoopBriefTransport(chapter_count=2),
+            loop_transport=_MultiChapterTransport(4, 5),
+            offline_generators=True,
+        )
+        RunWorker(coordinator, stage2, stage_timeout_seconds=30.0).run(coordinator.claim_next("worker-2"))
+        state = connection.execute("SELECT state FROM runs WHERE run_id='cont-2'").fetchone()
+        assert state == (RunStatus.SUCCEEDED.value,), f"continuation failed: {state}"
+        # The reused outline was mirrored into the current run and chapters committed.
+        mirrored = connection.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE artifact_id LIKE 'cont-1%plan%' AND run_id='cont-2' AND status='accepted' AND is_current=1"
+        ).fetchone()
+        chs = connection.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE run_id='cont-2' AND kind='chapter' AND status='accepted'"
+        ).fetchone()
+        assert chs[0] >= 2
+        assert mirrored[0] >= 1
+    finally:
+        database.__exit__(None, None, None)
+
+
+def test_memory_query_returns_confirmed_settings(projects_root: Path) -> None:
+    """memory_query (agent-loop mem_query tool) returns eligible confirmed memory."""
+    from novel_agent.context import memory_query
+
+    database = connect_project_database(projects_root / PROJECT_ID.root)
+    connection = database.__enter__()
+    try:
+        from novel_agent.storage import migrate
+
+        migrate(connection)
+        import hashlib as _hashlib
+        connection.execute(
+            "INSERT INTO runs(run_id, project_id, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("mem-run", PROJECT_ID.root, "succeeded", FIXED_TIME.isoformat(), FIXED_TIME.isoformat()),
+        )
+        connection.execute(
+            "INSERT INTO artifacts(artifact_id, revision, project_id, run_id, kind, status, raw_bytes, sha256, "
+            "schema_version, is_current, created_at) VALUES (?, ?, ?, ?, 'chapter', 'accepted', ?, ?, 1, 1, ?)",
+            ("mem-src", 1, PROJECT_ID.root, "mem-run", b"abcdefghij", _hashlib.sha256(b"abcdefghij").hexdigest(), FIXED_TIME.isoformat()),
+        )
+        import hashlib as _hashlib
+        body = b"abcdefghij"  # len 10 so span 1:4 is valid
+        connection.execute(
+            "INSERT INTO memory_records(memory_id, project_id, run_id, plan_revision, layer, kind, status, "
+            "subject_id, predicate, value_json, chapter_start, chapter_end, source_artifact_id, "
+            "source_artifact_revision, source_span, source_hash, confidence, created_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("mem-1", PROJECT_ID.root, "mem-run", 1, "m1_canonical", "character", "canonical",
+             "程屿", "是", '"男主"', 1, 1, "mem-src", 1, "1:4", _hashlib.sha256(b"bcd").hexdigest(),
+             1.0, "governed", FIXED_TIME.isoformat()),
+        )
+        hits = memory_query(connection, project_id=PROJECT_ID.root, query_terms=("程屿",))
+        assert any(hit.subject_id == "程屿" for hit in hits)
+    finally:
+        database.__exit__(None, None, None)
+
+
+def test_agent_loop_approval_pause_resumes_remaining_plan(projects_root: Path) -> None:
+    """A plan spanning two chapters pauses at the first approval gate and, after
+    approval, resumes the REMAINING plan steps automatically (regression: the
+    second chapter was dropped after a pause)."""
+    from novel_agent.default_stage import _AgentLoopStage
+    from novel_agent.loop_state import load_loop_state
+    from novel_agent.pathing import ProjectPathResolver
+    from novel_agent.run_coordinator import RunCoordinator
+    from novel_agent.run_models import StartRunRequest
+    from novel_agent.run_worker import RunWorker
+    from novel_agent.service import ApproveArtifactRequest, NovelAgentService
+    from novel_agent.service_models import StartNovelRunRequest as S
+
+    database = connect_project_database(projects_root / PROJECT_ID.root)
+    connection = database.__enter__()
+    try:
+        from novel_agent.storage import migrate
+
+        migrate(connection)
+        coordinator = RunCoordinator(connection, lambda: FIXED_TIME)
+        resolver = ProjectPathResolver(projects_root.parent)
+
+        # First run: full novel, chapters 1..3, auto-approved.
+        first = S(project_id=PROJECT_ID, run_id="ap-1", idempotency_key="ap-1",
+                  user_requirements="写一本三章的小说", provider="agent_loop", auto_approve=True)
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="ap-1", idempotency_key="ap-1"))
+        stage1 = _AgentLoopStage(
+            coordinator, first, resolver, lambda: FIXED_TIME,
+            transport=_LoopBriefTransport(chapter_count=5),
+            loop_transport=_MultiChapterTransport(1, 2, 3, with_prereqs=True),
+            offline_generators=True,
+        )
+        RunWorker(coordinator, stage1, stage_timeout_seconds=30.0).run(coordinator.claim_next("ap-w1"))
+        assert connection.execute("SELECT state FROM runs WHERE run_id='ap-1'").fetchone() == (RunStatus.SUCCEEDED.value,)
+
+        # Continuation run: plan writes chapters 4 and 5, but approval mode
+        # pauses at chapter 4.
+        cont = S(project_id=PROJECT_ID, run_id="ap-2", idempotency_key="ap-2",
+                 user_requirements="续写第4章和第5章", provider="agent_loop", auto_approve=False)
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="ap-2", idempotency_key="ap-2"))
+        stage2 = _AgentLoopStage(
+            coordinator, cont, resolver, lambda: FIXED_TIME,
+            transport=_LoopBriefTransport(chapter_count=2),
+            loop_transport=_MultiChapterTransport(4, 5),
+            offline_generators=True,
+        )
+        RunWorker(coordinator, stage2, stage_timeout_seconds=30.0).run(coordinator.claim_next("ap-w2"))
+        assert connection.execute("SELECT state FROM runs WHERE run_id='ap-2'").fetchone() == (RunStatus.WAITING_REVIEW.value,)
+        state = load_loop_state(connection, "ap-2")
+        assert state is not None
+        # The remaining plan (chapter 5) was persisted across the pause.
+        assert [tool for tool, _ in state.remaining_plan] == ["write_chapter"]
+
+        # First pause already staged chapter 4: approve it to requeue the run.
+        svc = NovelAgentService.from_config(now=lambda: FIXED_TIME)
+        staged0 = connection.execute(
+            "SELECT artifact_id, revision FROM artifacts WHERE run_id='ap-2' AND kind='chapter' AND status='staged' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        assert staged0 is not None
+        svc.approve_artifact(ApproveArtifactRequest(
+            project_id=PROJECT_ID, run_id="ap-2",
+            artifact_id=str(staged0[0]), revision=int(staged0[1]), idempotency_key="ap-appr-0",
+        ))
+        approved = 1
+        # Remaining loop: claim -> resume (AUTO-executes chapter 5) -> approve.
+        for round_no in range(1, 6):
+            lease = coordinator.claim_next("ap-worker")
+            if lease is None:
+                break
+            RunWorker(coordinator, stage2, stage_timeout_seconds=30.0).run(lease)
+            state = connection.execute("SELECT state FROM runs WHERE run_id='ap-2'").fetchone()
+            if state == (RunStatus.SUCCEEDED.value,):
+                break
+            staged = connection.execute(
+                "SELECT artifact_id, revision FROM artifacts WHERE run_id='ap-2' AND kind='chapter' AND status='staged' "
+                "ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if staged is None:
+                break
+            svc.approve_artifact(ApproveArtifactRequest(
+                project_id=PROJECT_ID, run_id="ap-2",
+                artifact_id=str(staged[0]), revision=int(staged[1]), idempotency_key=f"ap-appr-{round_no}",
+            ))
+            approved += 1
+            state = connection.execute("SELECT state FROM runs WHERE run_id='ap-2'").fetchone()
+            if state == (RunStatus.SUCCEEDED.value,):
+                break
+        assert approved >= 2
+        assert connection.execute("SELECT state FROM runs WHERE run_id='ap-2'").fetchone() == (RunStatus.SUCCEEDED.value,)
+        # BOTH chapters 4 and 5 accepted.
+        acc = connection.execute(
+            "SELECT COUNT(*) FROM artifacts WHERE run_id='ap-2' AND kind='chapter' AND status='accepted'"
+        ).fetchone()
+        assert acc[0] >= 2
+    finally:
+        database.__exit__(None, None, None)
+
+
+class _CancelledToken:
+    def is_cancelled(self) -> bool:
+        return True
+
+
+def test_loop_aborts_on_cancellation() -> None:
+    """A cancelled stage token stops the loop before any tool runs."""
+    called: list[str] = []
+    loop = AgentLoop(
+        tools={"a": _recorder_tool("a", called)},
+        transport=_SeqTransport(['{"plan": [{"tool": "a", "args": {}}]}']),
+        now=lambda: FIXED_TIME,
+        config=LoopConfig(max_steps=10),
+        cancellation=_CancelledToken(),
+    )
+    outcome, _history = loop.run(system_prompt="sys", task="任务")
+    assert outcome == "cancelled"
+    assert called == []
+
+
+class _SlowPlanTransport:
+    """Slows each model step so a CANCEL can land mid-run."""
+
+    def __init__(self, actions: list[str]) -> None:
+        self.actions = actions
+        self.calls = 0
+
+    def generate(self, request) -> ProviderTransportResult:
+        sleep(0.5)
+        content = self.actions[min(self.calls, len(self.actions) - 1)]
+        self.calls += 1
+        return ProviderTransportResult(content=content, model_name="t", prompt_tokens=1, completion_tokens=1)
+
+
+def test_agent_loop_cancel_mid_run_stops_stage(projects_root: Path) -> None:
+    """A CANCEL issued mid-run reaches the stage via worker polling and stops it."""
+    from novel_agent.default_stage import _AgentLoopStage
+    from novel_agent.pathing import ProjectPathResolver
+    from novel_agent.run_coordinator import RunCoordinator
+    from novel_agent.run_models import StartRunRequest
+    from novel_agent.run_worker import RunWorker
+    from novel_agent.contracts import RunCommandType
+    from novel_agent.run_models import ControlRunRequest
+    from novel_agent.service_models import StartNovelRunRequest as S
+    from threading import Thread
+
+    database = connect_project_database(projects_root / PROJECT_ID.root)
+    connection = database.__enter__()
+    try:
+        from novel_agent.storage import migrate
+
+        migrate(connection)
+        coordinator = RunCoordinator(connection, lambda: FIXED_TIME)
+        resolver = ProjectPathResolver(projects_root.parent)
+        req = S(project_id=PROJECT_ID, run_id="cancel-mid", idempotency_key="cancel-mid",
+                user_requirements="写一章", provider="agent_loop", auto_approve=True)
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="cancel-mid", idempotency_key="cancel-mid"))
+        stage = _AgentLoopStage(
+            coordinator, req, resolver, lambda: FIXED_TIME,
+            transport=_LoopBriefTransport(chapter_count=2),
+            loop_transport=_SlowPlanTransport([
+                '{"plan": [{"tool": "write_world", "args": {}}]}',
+                '{"done": true}',
+            ]),
+            offline_generators=True,
+        )
+        worker = RunWorker(coordinator, stage, stage_timeout_seconds=20.0)
+        lease = coordinator.claim_next("w")
+        assert lease is not None
+        result: list[object] = []
+        t = Thread(target=lambda: result.append(worker.run(lease)), daemon=True)
+        t.start()
+        sleep(0.3)  # let the loop start and enter the slow write_world model call
+        coordinator.control(ControlRunRequest(run_id="cancel-mid", command_type=RunCommandType.CANCEL, idempotency_key="cancel-1"))
+        t.join(15.0)
+        state = connection.execute("SELECT state FROM runs WHERE run_id='cancel-mid'").fetchone()
+        assert state is not None
+        assert state[0] in (RunStatus.CANCEL_REQUESTED.value, RunStatus.CANCELLED.value), f"state={state}"
+    finally:
+        database.__exit__(None, None, None)
+
+
+def test_cancel_waiting_review_completes_immediately() -> None:
+    """Cancelling a run waiting for review (nothing executing) completes at once."""
+    from novel_agent.contracts import RunCommandType
+    from novel_agent.run_state import next_state
+
+    assert next_state(RunStatus.QUEUED, RunCommandType.CANCEL) is RunStatus.CANCELLED
+    assert next_state(RunStatus.PAUSED, RunCommandType.CANCEL) is RunStatus.CANCELLED
+    assert next_state(RunStatus.WAITING_REVIEW, RunCommandType.CANCEL) is RunStatus.CANCELLED
+    assert next_state(RunStatus.RUNNING, RunCommandType.CANCEL) is RunStatus.CANCEL_REQUESTED
+
+
+def test_rollback_run_removes_artifacts_and_restores_pointer(projects_root: Path) -> None:
+    """Hard-rollback of a finished run deletes its artifacts/memory and falls
+    the current outline pointer back to the previous run's revision."""
+    from novel_agent.default_stage import _AgentLoopStage
+    from novel_agent.pathing import ProjectPathResolver
+    from novel_agent.run_coordinator import RunCoordinator
+    from novel_agent.run_models import StartRunRequest
+    from novel_agent.run_worker import RunWorker
+    from novel_agent.service import NovelAgentService
+    from novel_agent.service_models import StartNovelRunRequest as S
+
+    database = connect_project_database(projects_root / PROJECT_ID.root)
+    connection = database.__enter__()
+    try:
+        from novel_agent.storage import migrate
+
+        migrate(connection)
+        coordinator = RunCoordinator(connection, lambda: FIXED_TIME)
+        resolver = ProjectPathResolver(projects_root.parent)
+        svc = NovelAgentService.from_config(now=lambda: FIXED_TIME)
+
+        # First run: full novel (outline + chapter 1..3), auto-approved.
+        r1 = S(project_id=PROJECT_ID, run_id="rb-1", idempotency_key="rb-1",
+               user_requirements="写一本三章的小说", provider="agent_loop", auto_approve=True)
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="rb-1", idempotency_key="rb-1"))
+        stage1 = _AgentLoopStage(
+            coordinator, r1, resolver, lambda: FIXED_TIME,
+            transport=_LoopBriefTransport(chapter_count=5),
+            loop_transport=_MultiChapterTransport(1, 2, 3, with_prereqs=True),
+            offline_generators=True,
+        )
+        RunWorker(coordinator, stage1, stage_timeout_seconds=30.0).run(coordinator.claim_next("rb-w1"))
+        assert connection.execute("SELECT state FROM runs WHERE run_id='rb-1'").fetchone() == (RunStatus.SUCCEEDED.value,)
+        assert connection.execute("SELECT COUNT(*) FROM artifacts WHERE run_id='rb-1' AND kind='chapter' AND status='accepted'").fetchone()[0] >= 3
+
+        # Second run: continuation writes chapter 4 (new outline revision, advances is_current).
+        r2 = S(project_id=PROJECT_ID, run_id="rb-2", idempotency_key="rb-2",
+               user_requirements="续写第4章", provider="agent_loop", auto_approve=True)
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="rb-2", idempotency_key="rb-2"))
+        stage2 = _AgentLoopStage(
+            coordinator, r2, resolver, lambda: FIXED_TIME,
+            transport=_LoopBriefTransport(chapter_count=1),
+            loop_transport=_MultiChapterTransport(4),
+            offline_generators=True,
+        )
+        RunWorker(coordinator, stage2, stage_timeout_seconds=30.0).run(coordinator.claim_next("rb-w2"))
+        assert connection.execute("SELECT state FROM runs WHERE run_id='rb-2'").fetchone() == (RunStatus.SUCCEEDED.value,)
+        plan_id = connection.execute(
+            "SELECT artifact_id FROM artifacts WHERE kind='plan_contract' AND is_current=1"
+        ).fetchone()[0]
+        # rb-2 mirrored the outline under its own run and made it current.
+        current_run = connection.execute(
+            "SELECT run_id FROM artifacts WHERE artifact_id=? AND is_current=1", (str(plan_id),)
+        ).fetchone()[0]
+        assert current_run == "rb-2"
+        assert connection.execute("SELECT COUNT(*) FROM artifacts WHERE run_id='rb-2' AND kind='chapter' AND status='accepted'").fetchone()[0] >= 1
+
+        # Roll back rb-2: chapter 4 and rb-2's outline revision disappear; the
+        # current outline falls back to rb-1's revision; rb-2 becomes cancelled.
+        svc.rollback_run(PROJECT_ID, "rb-2")
+        assert connection.execute("SELECT state FROM runs WHERE run_id='rb-2'").fetchone() == (RunStatus.CANCELLED.value,)
+        assert connection.execute("SELECT COUNT(*) FROM artifacts WHERE run_id='rb-2'").fetchone()[0] == 0
+        current_run_after = connection.execute(
+            "SELECT run_id FROM artifacts WHERE artifact_id=? AND is_current=1", (str(plan_id),)
+        ).fetchone()
+        assert current_run_after is not None and current_run_after[0] == "rb-1"
+        # rb-1's chapters are untouched.
+        assert connection.execute("SELECT COUNT(*) FROM artifacts WHERE run_id='rb-1' AND kind='chapter' AND status='accepted'").fetchone()[0] >= 3
+    finally:
+        database.__exit__(None, None, None)
+
+
+def test_rollback_intent_and_start_auto_rollback(projects_root: Path) -> None:
+    """'去掉刚完成的内容' triggers a rollback of the latest succeeded run."""
+    from novel_agent.default_stage import _AgentLoopStage
+    from novel_agent.pathing import ProjectPathResolver
+    from novel_agent.run_coordinator import RunCoordinator
+    from novel_agent.run_models import StartRunRequest
+    from novel_agent.run_worker import RunWorker
+    from novel_agent.service import NovelAgentService, _is_rollback_intent
+    from novel_agent.service_models import StartNovelRunRequest as S
+
+    # Intent detection
+    assert _is_rollback_intent("我觉得刚刚写的东西不对，去掉刚刚完成的内容")
+    assert _is_rollback_intent("删除最近写的小说章节")
+    assert not _is_rollback_intent("写一本魔法学院的小说")
+    assert not _is_rollback_intent("续写第二章")
+
+    database = connect_project_database(projects_root / PROJECT_ID.root)
+    connection = database.__enter__()
+    try:
+        from novel_agent.storage import migrate
+
+        migrate(connection)
+        coordinator = RunCoordinator(connection, lambda: FIXED_TIME)
+        resolver = ProjectPathResolver(projects_root.parent)
+        r1 = S(project_id=PROJECT_ID, run_id="ri-1", idempotency_key="ri-1",
+               user_requirements="写一本三章的小说", provider="agent_loop", auto_approve=True)
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="ri-1", idempotency_key="ri-1"))
+        stage1 = _AgentLoopStage(
+            coordinator, r1, resolver, lambda: FIXED_TIME,
+            transport=_LoopBriefTransport(chapter_count=5),
+            loop_transport=_MultiChapterTransport(1, 2, 3, with_prereqs=True),
+            offline_generators=True,
+        )
+        RunWorker(coordinator, stage1, stage_timeout_seconds=30.0).run(coordinator.claim_next("ri-w1"))
+        assert connection.execute("SELECT state FROM runs WHERE run_id='ri-1'").fetchone() == (RunStatus.SUCCEEDED.value,)
+        n_before = connection.execute("SELECT COUNT(*) FROM artifacts WHERE run_id='ri-1'").fetchone()[0]
+        assert n_before > 0
+
+        svc = NovelAgentService.from_config(now=lambda: FIXED_TIME)
+        svc.start_auto(PROJECT_ID, "我觉得刚刚写的东西不对，去掉刚刚完成的内容", provider="agent_loop")
+        # The latest successful run (ri-1) was rolled back.
+        assert connection.execute("SELECT state FROM runs WHERE run_id='ri-1'").fetchone() == (RunStatus.CANCELLED.value,)
+        assert connection.execute("SELECT COUNT(*) FROM artifacts WHERE run_id='ri-1'").fetchone()[0] == 0
+    finally:
+        database.__exit__(None, None, None)
+
+
+class _FreshBriefTransport:
+    """Brief analysis flags a brand-new story (fresh=true)."""
+
+    def generate(self, request) -> ProviderTransportResult:
+        payload = {
+            "domain": "novel", "intent": "full_novel",
+            "goal": "写一部全新的魔法学院小说", "constraints": [], "style_guidance": [],
+            "acceptance_criteria": ["完全不同于旧故事"], "chapter_count": 2,
+            "fresh": True,
+        }
+        return ProviderTransportResult(content=json.dumps(payload, ensure_ascii=False), model_name="t", prompt_tokens=1, completion_tokens=1)
+
+
+def test_agent_loop_fresh_story_marks_brief_and_runs(projects_root: Path) -> None:
+    """A 'new story' request marks the brief as fresh; the run still completes."""
+    from novel_agent.default_stage import _AgentLoopStage
+    from novel_agent.pathing import ProjectPathResolver
+    from novel_agent.run_coordinator import RunCoordinator
+    from novel_agent.run_models import StartRunRequest
+    from novel_agent.run_worker import RunWorker
+    from novel_agent.service_models import StartNovelRunRequest as S
+
+    database = connect_project_database(projects_root / PROJECT_ID.root)
+    connection = database.__enter__()
+    try:
+        from novel_agent.storage import migrate
+
+        migrate(connection)
+        coordinator = RunCoordinator(connection, lambda: FIXED_TIME)
+        resolver = ProjectPathResolver(projects_root.parent)
+        req = S(project_id=PROJECT_ID, run_id="fresh-run", idempotency_key="fresh-run",
+                user_requirements="换个故事，写一部魔法学院小说", provider="agent_loop", auto_approve=True)
+        coordinator.submit_start(StartRunRequest(project_id=PROJECT_ID, run_id="fresh-run", idempotency_key="fresh-run"))
+        stage = _AgentLoopStage(
+            coordinator, req, resolver, lambda: FIXED_TIME,
+            transport=_FreshBriefTransport(),
+            loop_transport=_MultiChapterTransport(1, 2, with_prereqs=True),
+            offline_generators=True,
+        )
+        RunWorker(coordinator, stage, stage_timeout_seconds=30.0).run(coordinator.claim_next("fresh-w"))
+        assert connection.execute("SELECT state FROM runs WHERE run_id='fresh-run'").fetchone() == (RunStatus.SUCCEEDED.value,)
+        fresh = connection.execute(
+            "SELECT payload_json FROM run_events WHERE run_id='fresh-run' AND event_type='brief_analyzed'"
+        ).fetchone()
+        assert fresh is not None
+        assert json.loads(str(fresh[0])).get("fresh") is True
     finally:
         database.__exit__(None, None, None)

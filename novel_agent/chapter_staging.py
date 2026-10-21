@@ -103,8 +103,8 @@ def stage_candidates(connection: sqlite3.Connection, request: ChapterCandidateSt
             )
             connection.execute(
                 "INSERT INTO memory_candidates(candidate_id, run_id, source_artifact_id, source_artifact_revision, "
-                "extraction_schema_version, normalized_fact_hash, status, candidate_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "extraction_schema_version, normalized_fact_hash, status, candidate_json, chapter_number, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     identifier,
                     request.run_id,
@@ -114,6 +114,7 @@ def stage_candidates(connection: sqlite3.Connection, request: ChapterCandidateSt
                     evidence.normalized_fact_hash,
                     CandidateStatus.QUARANTINED.value,
                     candidate.model_dump_json(),
+                    request.staged.chapter_number,
                     proposal.created_at.isoformat(),
                 ),
             )

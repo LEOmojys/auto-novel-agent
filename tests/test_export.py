@@ -18,6 +18,16 @@ from tests.test_workflow_gateway import FIXED_TIME
 PROJECT_ID = ProjectId("novel-one")
 
 
+def _wait_for(predicate, timeout: float = 3.0) -> bool:
+    """Export is a best-effort compatibility view written after the run ends."""
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        if predicate():
+            return True
+        sleep(0.01)
+    return predicate()
+
+
 def _seed(connection) -> None:
     migrate(connection)
     connection.execute(
@@ -179,16 +189,12 @@ def test_auto_export_after_run_completes(tmp_path: Path, monkeypatch: pytest.Mon
         sleep(0.01)
     assert snapshot.status is RunStatus.SUCCEEDED
 
-    # The scheduler synced legacy-format files after the terminal state.
-    assert (project_root / "worlds").exists()
-    assert (project_root / "characters").exists()
-    assert (project_root / "novel").exists()
-    world_files = list((project_root / "worlds").glob("*.txt"))
-    assert world_files, "world export missing after run"
-    characters = list((project_root / "characters").glob("*.json"))
-    assert characters, "character export missing after run"
-    chapters = list((project_root / "novel").glob("*.json"))
-    assert chapters, "chapter export missing after run"
+    # The scheduler syncs legacy-format files asynchronously after the run
+    # reaches its terminal state, so wait for the derived view instead of
+    # assuming it is already on disk.
+    assert _wait_for(lambda: any((project_root / "worlds").glob("*.txt"))), "world export missing after run"
+    assert _wait_for(lambda: any((project_root / "characters").glob("*.json"))), "character export missing after run"
+    assert _wait_for(lambda: any((project_root / "novel").glob("*.json"))), "chapter export missing after run"
 
 
 def test_webui_export_endpoint(console) -> None:
@@ -254,7 +260,7 @@ def test_outline_only_run_produces_plan_without_chapters(tmp_path: Path, monkeyp
             ("outline-only",),
         ).fetchone()
         assert plan_memory[0] >= 1
-    # Legacy-format outline was exported automatically.
+    # Legacy-format outline is exported asynchronously after the run ends.
     outline_file = project_root / "novel" / "00_故事大纲.txt"
-    assert outline_file.is_file()
+    assert _wait_for(outline_file.is_file), "outline export missing after run"
     assert outline_file.read_text(encoding="utf-8").strip()

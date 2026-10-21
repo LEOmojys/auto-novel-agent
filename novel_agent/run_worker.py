@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from threading import Event, Lock, Thread
+from time import monotonic
 from typing import Protocol
 
 from novel_agent.run_coordinator import RunCoordinator
@@ -73,14 +74,36 @@ class RunWorker:
 
             stage_thread = Thread(target=execute, name="novel-agent-stage", daemon=True)
             stage_thread.start()
-            stage_thread.join(self._stage_timeout_seconds)
-            if stage_thread.is_alive():
+            # Poll for a user CANCEL while the stage runs, so the cancellation
+            # token reaches the stage promptly instead of only at timeout.
+            deadline = monotonic() + self._stage_timeout_seconds
+            while stage_thread.is_alive():
+                if self._coordinator.is_cancel_requested(lease.run_id):
+                    cancellation.cancel()
+                    break
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
+                stage_thread.join(min(self._cancellation_grace_seconds, remaining) or 0.01)
+            if stage_thread.is_alive() and not cancellation.is_cancelled():
                 cancellation.cancel()
                 stage_thread.join(self._cancellation_grace_seconds)
                 if stage_thread.is_alive():
                     release_lock = False
                     self._quarantine_until_finished(stage_thread)
+                # `fail_run` falls back to an independent connection when the
+                # stage still holds a transaction, so this call is safe even
+                # while the quarantined thread finishes.
                 self._coordinator.fail_run(lease, "stage_timeout")
+                return None
+            if stage_thread.is_alive():
+                # The user asked to cancel; give the cooperative stage a moment
+                # to finalize, then quarantine so this thread never touches the
+                # connection while the stage still owns it.
+                stage_thread.join(self._cancellation_grace_seconds)
+            if stage_thread.is_alive():
+                release_lock = False
+                self._quarantine_until_finished(stage_thread)
                 return None
             if errors:
                 self._coordinator.fail_run(lease, type(errors[0]).__name__)

@@ -400,11 +400,23 @@ def test_autoplan_to_completed_chapter(tmp_path: Path) -> None:
             "WHERE kind = 'chapter' AND status = 'accepted'"
         ).fetchone()
         assert artifact is not None and hashlib.sha256(bytes(artifact[2])).hexdigest() == artifact[3]
-        outbox = connection.execute("SELECT outbox_id, state FROM artifact_outbox").fetchone()
         outbox_digest = hashlib.sha256(
             f"{artifact[0]}:{artifact[1]}:{artifact[3]}".encode()
         ).hexdigest()
-        assert outbox == (outbox_digest, "pending")
+        # This test drives the stages directly (no scheduler), so drain the
+        # outbox explicitly; the scheduler path is covered by
+        # tests/test_artifact_outbox.py::test_scheduler_drains_committed_outbox.
+        import novel_agent.artifacts as artifacts_module
+        from novel_agent.pathing import ProjectPathResolver
+
+        artifacts_module.ArtifactService(
+            connection, ProjectPathResolver.from_config()
+        ).materialize_pending()
+        outbox = connection.execute(
+            "SELECT outbox_id, state FROM artifact_outbox WHERE artifact_id = ? AND artifact_revision = ?",
+            (artifact[0], artifact[1]),
+        ).fetchone()
+        assert outbox == (outbox_digest, "materialized")
         provider_call = connection.execute("SELECT request_sha256, state FROM provider_calls").fetchone()
         assert provider_call is not None and provider_call[1] == "succeeded"
         manifest = connection.execute(

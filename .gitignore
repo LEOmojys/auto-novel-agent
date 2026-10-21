@@ -32,3 +32,6 @@ test-results/
 
 # Personal documents (never publish)
 docs/
+
+# Runtime cache created when HOME resolves to "~" on Windows
+/~

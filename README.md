@@ -17,7 +17,7 @@
 ### 环境要求
 
 - Python 3.11+
-- DeepSeek API Key（仅 `legacy_real` 真实模型需要；`offline_fake` 可离线演示）
+- DeepSeek API Key（仅 `legacy_real` 真实模型需要；`agent_loop` 同理需要真实模型）
 
 ### 安装
 
@@ -40,7 +40,7 @@ cp .env.example .env
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` / `DEEPSEEK_API_KEY_1` | DeepSeek 密钥（后者优先） | 无 |
 | `NOVEL_AGENT_STAGE_TIMEOUT_SECONDS` | 单阶段超时；`legacy_real` 建议 7200 | 30 |
-| `NOVEL_AGENT_PROVIDER_MODE` | 默认 provider：`offline_fake` / `legacy_real` | `legacy_real` |
+| `NOVEL_AGENT_PROVIDER_MODE` | 默认 provider：`legacy_real` / `agent_loop`（`offline_fake` 仅供测试，UI 不暴露） | `legacy_real` |
 
 ### 启动控制台
 
@@ -60,7 +60,7 @@ python webui.py --port 8000
 ### 运行测试
 
 ```bash
-python -m pytest -q          # 全量（360+ 用例）
+python -m pytest -q          # 全量（400+ 用例）
 ```
 
 ## 架构概览
@@ -85,7 +85,7 @@ python -m pytest -q          # 全量（360+ 用例）
 | `novel_agent/adapters/` | DeepSeek governed 适配器、旧版兼容适配器 |
 | `novel_agent/run_*` | 运行状态机、调度器（单 Worker）、协调器、恢复 |
 | `novel_agent/webui/` | 零依赖 Web 控制台（静态前端 + REST API） |
-| `tests/` | 360+ 自动化测试 |
+| `tests/` | 400+ 自动化测试 |
 
 ## 项目结构（节选）
 
@@ -102,6 +102,17 @@ auto_novel_prompt/
 ├── webui.py                # 控制台入口
 └── .env.example            # 环境变量模板
 ```
+
+## 实现边界（预留 / 参考实现）
+
+以下模块已实现并有测试，但当前运行路径不依赖它们，**不能**视为已交付的运行时特性：
+
+- `novel_agent/provider.py::ProviderClient`、`RunCoordinator.record_provider_attempt/commit_task_result` 与 `provider_calls/task_results` 表：受管 provider 引擎的参考实现。当前 stage 通过 `LegacyDeepSeekTransport` 调用模型，调用轨迹记录在 `run_events`、`provider_failures` 与 `logs/token_usage.jsonl`。
+- `novel_agent/legacy_import.py`：旧项目导入库，未暴露 CLI/HTTP 入口。
+- `novel_agent/memory.py::MemoryGovernance`：候选晋升的参考实现；生产路径走 `memory_promotion` 与 `MemoryReviewService`。
+- `adapters/governance.py::LegacyEvaluationAdapter` 及 `contracts` 中的 `ContextPack` / `AuditReplayManifest`：兼容/合同层预留。
+
+已接线的可靠性能力：artifact outbox 由调度器在运行结束后物化到 `.governed/artifacts/`；连续性审计默认走 provider 结构化评审（`NOVEL_AGENT_CONTINUITY_AUDIT=offline` 可回退）；agent_loop 的章节质量门使用真实六维评审。
 
 ## 许可
 

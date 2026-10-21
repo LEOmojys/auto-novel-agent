@@ -32,9 +32,13 @@ def next_state(current: RunStatus, command: RunCommandType) -> RunStatus | None:
             return RunStatus.QUEUED if current is RunStatus.PAUSED else None
         case RunCommandType.CANCEL:
             match current:
-                case RunStatus.QUEUED | RunStatus.PAUSED:
+                case RunStatus.QUEUED | RunStatus.PAUSED | RunStatus.WAITING_REVIEW:
+                    # Waiting for a worker / paused / queued: nothing is
+                    # executing, so the cancel completes immediately.
                     return RunStatus.CANCELLED
-                case RunStatus.RUNNING | RunStatus.WAITING_REVIEW:
+                case RunStatus.RUNNING:
+                    # A worker is executing; mark it so the worker aborts and
+                    # the stage finalizes the run as cancelled.
                     return RunStatus.CANCEL_REQUESTED
                 case RunStatus.CANCELLED | RunStatus.CANCEL_REQUESTED | RunStatus.FAILED | RunStatus.SUCCEEDED:
                     return None

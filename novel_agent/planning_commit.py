@@ -9,6 +9,7 @@ from novel_agent.adapters import CharacterAdaptation, OutlineAdaptation, WorldAd
 from novel_agent.contracts import StoryBrief
 from novel_agent.pathing import ProjectId
 from novel_agent.planning_audit import PlanningAuditRequest, insert_planning_audit_manifest
+from novel_agent.artifacts import enqueue_materialization
 from novel_agent.planning_memory_commit import insert_memory, memory_writes
 from novel_agent.run_event_store import append_run_event
 from novel_agent.run_state import RunEvent
@@ -176,6 +177,15 @@ def _insert_artifact(
             artifact.schema_version,
             committed_at.isoformat(),
         ),
+    )
+    enqueue_materialization(
+        connection,
+        project_id=request.project_id.root,
+        artifact_id=artifact.artifact_id,
+        revision=1,
+        raw_bytes=artifact.raw_bytes,
+        sha256=artifact.sha256,
+        created_at=committed_at,
     )
 
 

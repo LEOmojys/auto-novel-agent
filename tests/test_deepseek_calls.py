@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -28,6 +29,14 @@ class _FakeResponse:
             return self._payload
         raise ValueError("invalid json")
 
+    def iter_content(self, chunk_size: int = 4096):
+        body = self.text.encode("utf-8")
+        for offset in range(0, len(body), chunk_size):
+            yield body[offset : offset + chunk_size]
+
+    def close(self) -> None:
+        return None
+
 
 class _HttpError(Exception):
     def __init__(self, status_code: int) -> None:
@@ -53,7 +62,7 @@ def _install(monkeypatch: pytest.MonkeyPatch, *responses: _FakeResponse) -> list
     captured: list[dict] = []
     queue = list(responses)
 
-    def fake_post(url, headers=None, data=None, timeout=None):
+    def fake_post(url, headers=None, data=None, timeout=None, stream=None):
         captured.append(
             {"url": url, "body": json.loads(data), "timeout": timeout, "auth": headers.get("Authorization")}
         )
@@ -136,7 +145,7 @@ def test_responses_api_style_builds_url_and_parses_output(monkeypatch: pytest.Mo
         "usage": {"prompt_tokens": 11, "completion_tokens": 4},
     }
 
-    def fake_post(url, headers=None, data=None, timeout=None):
+    def fake_post(url, headers=None, data=None, timeout=None, stream=None):
         captured.append({"url": url, "body": json.loads(data), "auth": headers.get("Authorization")})
         return _FakeResponse(200, payload)
 
@@ -160,7 +169,7 @@ def test_chat_style_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LLM_API_STYLE", raising=False)
     captured: list[dict] = []
 
-    def fake_post(url, headers=None, data=None, timeout=None):
+    def fake_post(url, headers=None, data=None, timeout=None, stream=None):
         captured.append({"url": url, "body": json.loads(data)})
         return _FakeResponse(200, {"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
 
@@ -171,3 +180,77 @@ def test_chat_style_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result == "ok"
     assert captured[0]["url"] == "https://api.deepseek.com/v1/chat/completions"
     assert "messages" in captured[0]["body"]
+
+
+class _HangingResponse(_FakeResponse):
+    """A response whose body streams slowly, so a cancel can abort mid-read."""
+
+    def __init__(self, status_code: int, payload: dict | str, token=None, hang_after: int = 1) -> None:
+        super().__init__(status_code, payload)
+        self._token = token
+        self._hang_after = hang_after
+        self.closed = False
+
+    def iter_content(self, chunk_size: int = 4096):
+        body = self.text.encode("utf-8")
+        first = body[: self._hang_after]
+        if first:
+            yield first
+        # Simulate the rest of the body arriving only after the cancel lands:
+        while self._token is not None and not self._token.is_cancelled():
+            time.sleep(0.01)
+        # If cancelled, stop; otherwise yield the remainder.
+        if self._token is not None and self._token.is_cancelled():
+            self.closed = True
+            return
+        if len(body) > self._hang_after:
+            yield body[self._hang_after :]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _Cancellable:
+    def __init__(self) -> None:
+        self._flag = False
+
+    def cancel(self) -> None:
+        self._flag = True
+
+    def is_cancelled(self) -> bool:
+        return self._flag
+
+
+def test_access_deepseek_aborts_inflight_request_on_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A user cancel interrupts an in-flight HTTP body read instead of waiting."""
+    from tools_call_deepseek import access_deepseek
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_MODEL", "glm-4.7")
+    monkeypatch.setenv("LLM_API_STYLE", "chat")
+    token = _Cancellable()
+    payload = {"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+    hung = _HangingResponse(200, payload, token=token, hang_after=1)
+
+    def fake_post(url, headers=None, data=None, timeout=None, stream=None):
+        return hung
+
+    monkeypatch.setattr("tools_call_deepseek.requests.post", fake_post)
+
+    import threading
+
+    def run_call() -> list[object]:
+        try:
+            result = access_deepseek("你好", max_retry=1, cancellation=token)
+            return [result]
+        except Exception as error:  # noqa: BROAD_EXCEPT_OK
+            return [error]
+
+    out: list[object] = []
+    t = threading.Thread(target=lambda: out.extend(run_call()), daemon=True)
+    t.start()
+    time.sleep(0.15)  # let the stream start and stall
+    token.cancel()  # user cancels mid-request
+    t.join(2.0)
+    assert not t.is_alive(), "access_deepseek did not abort the cancelled request"
+    assert hung.closed

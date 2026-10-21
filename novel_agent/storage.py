@@ -14,6 +14,7 @@ from novel_agent.migrations.v3_revisions import REVISION_SCHEMA_STATEMENTS
 from novel_agent.migrations.v4_tool_call_results import TOOL_CALL_RESULT_SCHEMA_STATEMENTS
 from novel_agent.migrations.v5_m4_retrieval import M4_RETRIEVAL_SCHEMA_STATEMENTS
 from novel_agent.migrations.v6_provider_failures import PROVIDER_FAILURE_SCHEMA_STATEMENTS
+from novel_agent.migrations.v7_memory_completion import MEMORY_COMPLETION_SCHEMA_STATEMENTS
 from novel_agent.sqlite_transactions import TransactionStateError, write_transaction
 from novel_agent.tool_call_ledger import (
     ToolCallLedgerWrite,
@@ -24,7 +25,7 @@ from novel_agent.tool_call_ledger import (
 )
 
 DATABASE_FILENAME: Final = "agent.sqlite"
-CURRENT_SCHEMA_VERSION: Final = 6
+CURRENT_SCHEMA_VERSION: Final = 7
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +91,11 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
         version=6,
         name="provider_failure_traceability",
         statements=PROVIDER_FAILURE_SCHEMA_STATEMENTS,
+    ),
+    Migration(
+        version=7,
+        name="memory_completion",
+        statements=MEMORY_COMPLETION_SCHEMA_STATEMENTS,
     ),
 )
 

@@ -48,9 +48,8 @@
       <div class="field">
         <label class="field-label" for="provider-select">模型 Provider</label>
         <select id="provider-select">
-          <option value="offline_fake">offline_fake（演示）</option>
-          <option value="legacy_real">legacy_real（真实模型）</option>
-          <option value="agent_loop">agent_loop（模型自决循环）</option>
+          <option value="legacy_real">legacy_real锛堢湡瀹炴ā鍨嬶級</option>
+          <option value="agent_loop">agent_loop锛堟ā鍨嬭嚜鍐冲惊鐜級</option>
         </select>
       </div>
 
@@ -64,6 +63,7 @@
         <button id="pause-btn" disabled>暂停</button>
         <button id="resume-btn" disabled>继续</button>
         <button id="cancel-btn" disabled>取消</button>
+        <button id="rollback-btn" disabled title="回滚该 run：删除它产出的内容，恢复到此 run 之前">回滚</button>
         <button id="repair-btn" disabled>修复重排</button>
         <span class="sep"></span>
         <button id="refresh-btn">刷新</button>
@@ -100,6 +100,13 @@
           <span class="panel-tag">点击切换</span>
         </div>
         <ul id="run-history" class="history"></ul>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>记忆审阅</h2>
+          <span class="panel-tag">待处理候选</span>
+        </div>
+        <div id="memory-candidates" class="task-list"></div>
       </section>
     </aside>
 

@@ -28,6 +28,7 @@ from novel_agent.run_event_store import append_run_event
 from novel_agent.run_recovery import load_recovery_state
 from novel_agent.run_state import RunEvent, command_id as build_command_id
 from novel_agent.run_transition import resolve_control_transition
+from novel_agent.sqlite_transactions import TransactionStateError
 from novel_agent.storage import write_transaction
 
 if TYPE_CHECKING:
@@ -210,6 +211,28 @@ class RunCoordinator(RevisionCoordinatorMixin, ChapterCoordinatorMixin, Planning
         self._connection.execute(
             "DELETE FROM chapter_branches WHERE run_id = ?", (run_id,)
         )
+        purged_memory_ids = [
+            str(row[0])
+            for row in self._connection.execute(
+                "SELECT memory_id FROM memory_records WHERE run_id = ? AND layer IN "
+                "('m0_candidate', 'm2_plan', 'm4_retrieval', 'm5_working')",
+                (run_id,),
+            ).fetchall()
+        ]
+        if purged_memory_ids:
+            placeholders = ", ".join("?" for _ in purged_memory_ids)
+            self._connection.execute(
+                f"UPDATE memory_records SET supersedes_id = NULL "
+                f"WHERE supersedes_id IN ({placeholders})",
+                tuple(purged_memory_ids),
+            )
+        for identifier in purged_memory_ids:
+            self._connection.execute(
+                "DELETE FROM memory_edges WHERE source_memory_id = ? OR target_memory_id = ?",
+                (identifier, identifier),
+            )
+            self._connection.execute("DELETE FROM memory_fts WHERE memory_id = ?", (identifier,))
+        self._connection.execute("DELETE FROM context_packs WHERE run_id = ?", (run_id,))
         self._connection.execute(
             "DELETE FROM memory_records WHERE run_id = ? AND layer IN "
             "('m0_candidate', 'm2_plan', 'm4_retrieval', 'm5_working')",
@@ -404,21 +427,36 @@ class RunCoordinator(RevisionCoordinatorMixin, ChapterCoordinatorMixin, Planning
             append_run_event(self._connection, RunEvent(lease.run_id, "task_started", {"task": request.task_id}, self._now()))
 
     def fail_run(self, lease: RunLease, reason: str) -> bool:
-        with write_transaction(self._connection):
-            if not self._is_current_lease(lease):
+        try:
+            return self._fail_run_on(self._connection, lease, reason)
+        except TransactionStateError:
+            # The stage thread currently owns a transaction on the main
+            # connection (timeout path).  Finalize the run on an independent
+            # connection instead of waiting for the stage to finish.
+            connection = self._write_connection()
+            if connection is None:
+                return False
+            try:
+                return self._fail_run_on(connection, lease, reason)
+            finally:
+                connection.close()
+
+    def _fail_run_on(self, connection: sqlite3.Connection, lease: RunLease, reason: str) -> bool:
+        with write_transaction(connection):
+            if not self._is_current_lease(lease, connection=connection):
                 # The lease may have expired during a long LLM call; the run
                 # must still leave RUNNING or it appears stuck forever.
-                row = self._connection.execute(
+                row = connection.execute(
                     "SELECT state FROM runs WHERE run_id = ?", (lease.run_id,)
                 ).fetchone()
                 if row is None or str(row[0]) != RunStatus.RUNNING.value:
                     return False
             now = self._now()
-            self._connection.execute(
+            connection.execute(
                 "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ? AND state = ?",
                 (RunStatus.FAILED.value, now.isoformat(), lease.run_id, RunStatus.RUNNING.value),
             )
-            append_run_event(self._connection, RunEvent(lease.run_id, "run_failed", {"reason": reason}, now))
+            append_run_event(connection, RunEvent(lease.run_id, "run_failed", {"reason": reason}, now))
             return True
 
     def record_provider_attempt(self, lease: RunLease, request: ProviderAttemptRequest) -> CommitDisposition:
@@ -534,6 +572,52 @@ class RunCoordinator(RevisionCoordinatorMixin, ChapterCoordinatorMixin, Planning
             raise RunTransitionError(run_id, "missing", "unknown")
         return RunStatus(str(row[0]))
 
+    def is_cancel_requested(self, run_id: str) -> bool:
+        """Whether the run has been asked to cancel (for worker polling).
+
+        The stage thread owns the main connection; polling it from the worker
+        thread would risk reading inside the stage's transaction.  A short
+        read-only connection keeps the poll separate from stage writes.
+        """
+        connection = self._read_only_connection()
+        try:
+            row = (connection or self._connection).execute(
+                "SELECT state FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        finally:
+            if connection is not None:
+                connection.close()
+        return row is not None and str(row[0]) in (
+            RunStatus.CANCEL_REQUESTED.value,
+            RunStatus.CANCELLED.value,
+        )
+
+    def _write_connection(self) -> sqlite3.Connection | None:
+        row = self._connection.execute("PRAGMA database_list").fetchone()
+        path = "" if row is None else str(row[2])
+        if not path:
+            return None
+        try:
+            connection = sqlite3.connect(f"file:{path}", uri=True, timeout=5.0)
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.execute("PRAGMA foreign_keys = ON")
+            return connection
+        except sqlite3.Error:
+            return None
+
+    def _read_only_connection(self) -> sqlite3.Connection | None:
+        row = self._connection.execute("PRAGMA database_list").fetchone()
+        path = "" if row is None else str(row[2])
+        if not path:
+            return None
+        try:
+            connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+            connection.execute("PRAGMA busy_timeout = 2000")
+            return connection
+        except sqlite3.Error:
+            return None
+
     def _has_running_run(self) -> bool:
         return self._connection.execute(
             "SELECT 1 FROM runs WHERE state = ? LIMIT 1", (RunStatus.RUNNING.value,)
@@ -554,8 +638,12 @@ class RunCoordinator(RevisionCoordinatorMixin, ChapterCoordinatorMixin, Planning
         if not self._is_current_lease(lease):
             raise RunLeaseError(lease.run_id)
 
-    def _is_current_lease(self, lease: RunLease) -> bool:
-        row = self._connection.execute(
+    def _is_current_lease(
+        self,
+        lease: RunLease,
+        connection: sqlite3.Connection | None = None,
+    ) -> bool:
+        row = (connection or self._connection).execute(
             "SELECT l.holder_id, l.fencing_token, l.expires_at, r.state FROM run_leases l "
             "JOIN runs r ON r.run_id = l.run_id WHERE l.run_id = ?",
             (lease.run_id,),

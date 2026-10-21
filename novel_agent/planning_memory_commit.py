@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from novel_agent.contracts import MemoryLayer
 from novel_agent.memory_models import MemoryFactKind
-from novel_agent.memory_store import record_status
+from novel_agent.memory_store import index_memory, record_status
 
 if TYPE_CHECKING:
     from novel_agent.planning_commit import PlanningCommitRequest
@@ -102,10 +102,7 @@ def insert_memory(
             committed_at.isoformat(),
         ),
     )
-    connection.execute(
-        "INSERT INTO memory_fts(memory_id, content) VALUES (?, ?)",
-        (memory.memory_id, memory.value_json),
-    )
+    index_memory(connection, memory.memory_id, memory.value_json)
 
 
 def _stable_id(value: str) -> str:

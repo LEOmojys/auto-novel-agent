@@ -32,7 +32,7 @@ class CallbackResponse(TypedDict):
     data: list[str | CallbackUpdate | None]
 
 
-def test_canonical_gradio_defaults_provider_to_offline_fake(tmp_path: Path) -> None:
+def test_canonical_gradio_defaults_provider_to_legacy_real(tmp_path: Path) -> None:
     # Given: a canonical Gradio app over an isolated governed service.
     service = NovelAgentService(ProjectPathResolver(tmp_path / "projects"), now=lambda: FIXED_TIME)
     app = create_novel_app(service)
@@ -43,12 +43,12 @@ def test_canonical_gradio_defaults_provider_to_offline_fake(tmp_path: Path) -> N
         for component in app.config["components"]
         if component.get("type") == "dropdown"
         and component.get("props", {}).get("choices")
-        == [("offline_fake", "offline_fake"), ("legacy_real", "legacy_real")]
+        == [("legacy_real", "legacy_real"), ("agent_loop", "agent_loop")]
     )
 
-    # Then: offline_fake is the selectable default rather than a live provider.
+    # Then: a real provider is the selectable default; offline demo is not exposed.
     try:
-        assert provider_component["props"]["value"] == "offline_fake"
+        assert provider_component["props"]["value"] == "legacy_real"
     finally:
         app.close()
 

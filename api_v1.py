@@ -51,8 +51,9 @@ def create_novel_app(service: NovelAgentService | None = None) -> gr.Blocks:
                 run_id_textbox = gr.Textbox(label="运行标识", placeholder="例如：run-001")
                 requirements_textbox = gr.Textbox(label="创作需求", lines=8)
                 provider_dropdown = gr.Dropdown(
-                    choices=["offline_fake", "legacy_real"],
-                    value="offline_fake",
+                    choices=["legacy_real", "agent_loop"],
+                    value="legacy_real",
+                    allow_custom_value=True,
                     label="提供方",
                     interactive=True,
                 )

@@ -19,6 +19,7 @@ class CandidateStatus(StrEnum):
     NEEDS_REVIEW = "needs_review"
     CONFLICTED = "conflicted"
     PROMOTED = "promoted"
+    REJECTED = "rejected"
 
 
 @unique
@@ -58,6 +59,10 @@ class PromotionAuthority(StrEnum):
     USER_RETCON = "user_retcon"
     VALIDATED_PLAN = "validated_plan"
     ACCEPTED_CHAPTER = "accepted_chapter"
+    #: A human explicitly accepted a candidate the automatic policy could not
+    #: promote (inference, low confidence, entity ambiguity) without changing
+    #: an existing fact.
+    USER_REVIEW = "user_review"
 
 
 @unique

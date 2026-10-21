@@ -15,7 +15,10 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from novel_agent.contracts import MemoryLayer
+from novel_agent.contracts import MemoryLayer
 from novel_agent.memory_models import MemoryFactKind
+from novel_agent.artifacts import enqueue_materialization
+from novel_agent.memory_store import index_memory, record_status
 from novel_agent.run_event_store import append_run_event
 from novel_agent.run_state import RunEvent
 from novel_agent.sqlite_transactions import write_transaction
@@ -227,14 +230,16 @@ def _insert_m2_memory(
     connection.execute(
         "INSERT INTO memory_records(memory_id, project_id, run_id, plan_revision, layer, kind, status, subject_id, "
         "predicate, value_json, source_artifact_id, source_artifact_revision, source_span, source_hash, confidence, "
-        "created_by, created_at) VALUES (?, ?, ?, ?, 'm2_plan', ?, 'validated', ?, ?, ?, ?, 1, ?, ?, 1.0, "
+        "created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1.0, "
         "'partial-commit:v1', ?) ON CONFLICT(memory_id) DO NOTHING",
         (
             memory_id,
             project_id,
             run_id,
             plan_revision,
+            MemoryLayer.M2_PLAN.value,
             kind.value,
+            record_status(MemoryLayer.M2_PLAN),
             subject_id,
             predicate,
             value_json,
@@ -244,10 +249,7 @@ def _insert_m2_memory(
             committed_at.isoformat(),
         ),
     )
-    connection.execute(
-        "INSERT INTO memory_fts(memory_id, content) VALUES (?, ?)",
-        (memory_id, value_json),
-    )
+    index_memory(connection, memory_id, value_json)
 
 
 def _insert_artifact(
@@ -274,6 +276,14 @@ def _insert_artifact(
             committed_at.isoformat(),
         ),
     )
+    enqueue_materialization(
+        connection,
+        project_id=project_id,
+        artifact_id=artifact_id,
+        revision=1,
+        raw_bytes=raw_bytes,
+        created_at=committed_at,
+    )
 
 
 def _insert_m1_memory(
@@ -295,14 +305,16 @@ def _insert_m1_memory(
     connection.execute(
         "INSERT INTO memory_records(memory_id, project_id, run_id, plan_revision, layer, kind, status, subject_id, "
         "predicate, value_json, source_artifact_id, source_artifact_revision, source_span, source_hash, confidence, "
-        "created_by, created_at) VALUES (?, ?, ?, ?, 'm1_canonical', ?, 'validated', ?, ?, ?, ?, 1, ?, ?, 1.0, "
+        "created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1.0, "
         "'partial-commit:v1', ?) ON CONFLICT(memory_id) DO NOTHING",
         (
             memory_id,
             project_id,
             run_id,
             plan_revision,
+            MemoryLayer.M1_CANONICAL.value,
             kind.value,
+            record_status(MemoryLayer.M1_CANONICAL),
             subject_id,
             predicate,
             value_json,
@@ -312,10 +324,7 @@ def _insert_m1_memory(
             committed_at.isoformat(),
         ),
     )
-    connection.execute(
-        "INSERT INTO memory_fts(memory_id, content) VALUES (?, ?)",
-        (memory_id, value_json),
-    )
+    index_memory(connection, memory_id, value_json)
 
 
 def _complete_run(connection: sqlite3.Connection, run_id: str, committed_at: datetime) -> None:

@@ -326,7 +326,8 @@ def execute_single_chapter(
     delegates here, keeping both paths byte-identical.
     """
     context = workflow.context_builder.build(
-        context_request(lease.run_id, request, chapter, workflow.policy.context_budget)
+        context_request(lease.run_id, request, chapter, workflow.policy.context_budget),
+        persist=True,
     )
     workflow._emit_stage("chapter_prepare_complete")
     current_brief: RepairBrief | None = None

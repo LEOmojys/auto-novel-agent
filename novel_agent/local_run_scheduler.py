@@ -152,11 +152,19 @@ class LocalRunScheduler:
 
     @staticmethod
     def _sync_exports(connection: sqlite3.Connection, project_id: ProjectId) -> None:
-        """Materialize legacy-format files from the authoritative SQLite state.
+        """Drain the artifact outbox, then materialize legacy-format files.
 
-        Export failures never break the drain loop; the web console also
-        exposes a manual export endpoint.
+        Both are best-effort derived views over authoritative SQLite state;
+        failures never break the drain loop (the console exposes manual
+        export/materialization entry points).
         """
+        try:
+            from novel_agent.artifacts import ArtifactService
+            from novel_agent.pathing import ProjectPathResolver
+
+            ArtifactService(connection, ProjectPathResolver.from_config()).materialize_pending()
+        except Exception:  # noqa: BROAD_EXCEPT_OK - outbox drain is best-effort
+            pass
         try:
             from novel_agent.export import export_project
 

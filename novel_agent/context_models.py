@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_core import PydanticCustomError
@@ -50,6 +51,11 @@ class ContextRequest(BaseModel):
     query_terms: tuple[str, ...] = ()
     style_guidance: tuple[str, ...] = ()
     budget: ContextBudget = ContextBudget()
+    # "chapter" keeps the strict per-chapter view (no future chapters, only the
+    # active plan revision).  "project" is the explicit-retrieval view used by
+    # the agent's mem_query tool: it may read any confirmed chapter and any
+    # plan revision because the caller asks for project knowledge directly.
+    scope: Literal["chapter", "project"] = "chapter"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +71,8 @@ class ContextItem:
     source_artifact_revision: int
     artifact_hash: str
     source_hash: str
+    fts_score: float = 0.0
+    truncated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +99,7 @@ class ContextBuildResult:
     digest: str
     tokenizer_version: str
     budget_ledger: BudgetLedger
+    pack_id: str | None = None
 
     @property
     def memory_ids(self) -> tuple[str, ...]:

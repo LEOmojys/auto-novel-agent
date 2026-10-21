@@ -180,7 +180,7 @@ def _parse_response(style: str, response_json: dict, model: str, caller_label: s
 
 
 def access_deepseek(text, max_retry=3, model_name=None,
-                    return_tokens=False, caller=""):
+                    return_tokens=False, caller="", cancellation=None):
     """Call the configured OpenAI-compatible API (chat-completions or Responses).
 
     Endpoint, API key, model names and protocol style are read from the
@@ -194,6 +194,9 @@ def access_deepseek(text, max_retry=3, model_name=None,
     - Non-retryable HTTP codes (401/402/403/400/422) fail immediately with the
       status exposed; only 429/5xx/transport errors retry with backoff.
     - A model failure falls back to the configured fallback model.
+    - ``cancellation`` (optional ``is_cancelled()`` token) streams the response
+      body so a user cancel aborts an in-flight request promptly instead of
+      waiting out the 300s timeout.
     """
     base_url = get_base_url()
     style = get_api_style()
@@ -220,6 +223,7 @@ def access_deepseek(text, max_retry=3, model_name=None,
                     headers=headers,
                     data=json.dumps(data),
                     timeout=300,
+                    stream=True,
                 )
                 if response.status_code in _NON_RETRYABLE_STATUS:
                     raise ProviderCallError(
@@ -228,7 +232,22 @@ def access_deepseek(text, max_retry=3, model_name=None,
                     )
                 response.raise_for_status()
 
-                response_json = response.json()
+                # Stream the body so a cancel can abort the in-flight request.
+                chunks: list[bytes] = []
+                for chunk in response.iter_content(chunk_size=4096):
+                    if cancellation is not None and cancellation.is_cancelled():
+                        response.close()
+                        raise ProviderCallError(0, "cancelled")
+                    if chunk:
+                        chunks.append(chunk)
+                body = b"".join(chunks)
+                try:
+                    response_json = json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as decode_error:
+                    raise ProviderCallError(
+                        response.status_code,
+                        f"LLM API {response.status_code}: invalid JSON body",
+                    ) from decode_error
                 response_txt, token_info = _parse_response(style, response_json, model, caller_label)
 
                 if return_tokens:

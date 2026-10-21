@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -58,8 +59,32 @@ class ProviderTransportResult(BaseModel):
 
 
 class ProviderTransport(Protocol):
-    def generate(self, request: ProviderRequest) -> ProviderTransportResult:
+    def generate(
+        self,
+        request: ProviderRequest,
+        cancellation: object | None = None,
+    ) -> ProviderTransportResult:
+        """Invoke the model.
+
+        ``cancellation`` is an optional token exposing ``is_cancelled()``; a
+        transport that can abort an in-flight request (e.g. streaming HTTP)
+        should honor it so a user cancel takes effect promptly.
+        """
         ...
+
+
+def _call_accepts_cancellation(call) -> bool:
+    """Whether a legacy callable accepts an optional cancellation keyword."""
+    try:
+        parameters = tuple(inspect.signature(call).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    for parameter in parameters:
+        if parameter.name == "cancellation":
+            return True
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
 
 
 class LegacyDeepSeekCallable(Protocol):
@@ -71,6 +96,7 @@ class LegacyDeepSeekCallable(Protocol):
         model_name: str,
         return_tokens: Literal[True],
         caller: str,
+        cancellation: object | None = None,
     ) -> tuple[str, Mapping[str, int | str]]:
         ...
 
@@ -101,15 +127,29 @@ class _LegacyUsage(BaseModel):
 class LegacyDeepSeekTransport:
     call: LegacyDeepSeekCallable
 
-    def generate(self, request: ProviderRequest) -> ProviderTransportResult:
+    def generate(
+        self,
+        request: ProviderRequest,
+        cancellation: object | None = None,
+    ) -> ProviderTransportResult:
         try:
-            content, usage = self.call(
-                request.prompt,
-                max_retry=1,
-                model_name=request.model_name,
-                return_tokens=True,
-                caller="novel_agent",
-            )
+            if _call_accepts_cancellation(self.call):
+                content, usage = self.call(
+                    request.prompt,
+                    max_retry=1,
+                    model_name=request.model_name,
+                    return_tokens=True,
+                    caller="novel_agent",
+                    cancellation=cancellation,
+                )
+            else:
+                content, usage = self.call(
+                    request.prompt,
+                    max_retry=1,
+                    model_name=request.model_name,
+                    return_tokens=True,
+                    caller="novel_agent",
+                )
         except ProviderTransportError:
             raise
         except Exception as error:  # noqa: BROAD_EXCEPT_OK - legacy callback has no typed error contract.

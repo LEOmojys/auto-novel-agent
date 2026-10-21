@@ -83,7 +83,7 @@ class RunUiController:
         project_name: str,
         run_id: str,
         requirements: str,
-        provider: Literal["offline_fake", "legacy_real"],
+        provider: Literal["legacy_real", "agent_loop"],
     ) -> RunUiResult:
         requirements_sha256 = hashlib.sha256(requirements.encode("utf-8")).hexdigest()
         try:

@@ -580,3 +580,22 @@ input::placeholder, textarea::placeholder { color: var(--text-faint); }
   .topbar-fields { width: 100%; }
   .llm-status { margin-left: 0; }
 }
+
+
+/* ---------- 记忆审阅 ---------- */
+.memory-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.memory-title { font-size: 12px; color: var(--text); }
+.memory-meta {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  word-break: break-all;
+}
+.memory-actions { display: flex; gap: 8px; }

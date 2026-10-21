@@ -13,7 +13,6 @@ from novel_agent.memory_models import (
     MemoryFactKind,
     MemoryPromotionResult,
     MemoryProposal,
-    PromotedMemory,
     PromotionAuthority,
     PromotionOutcome,
     RetrievalView,
@@ -22,6 +21,7 @@ from novel_agent.memory_models import (
     WorkingContext,
 )
 from novel_agent.memory_policy import decide_promotion
+from novel_agent.memory_promotion import insert_promoted_memory
 from novel_agent.memory_store import (
     MemoryErrorCode,
     MemoryGovernanceError,
@@ -30,7 +30,6 @@ from novel_agent.memory_store import (
     load_promoted_memory,
     load_source,
     memory_id,
-    record_status,
     refresh_candidate_evidence,
 )
 from novel_agent.storage import write_transaction
@@ -168,57 +167,23 @@ class MemoryGovernance:
         subject_id = proposal.subject_id
         if subject_id is None:
             raise MemoryGovernanceError(MemoryErrorCode.INVALID_PROMOTION)
-        promoted = PromotedMemory(
-            memory_id=memory_id(candidate.candidate_id),
-            memory_layer=proposal.target_layer,
-            source_artifact_id=proposal.source_artifact_id,
-            source_artifact_revision=proposal.source_artifact_revision,
-            source_span=f"{evidence.source_byte_start}:{evidence.source_byte_end}",
-            source_span_sha256=evidence.source_span_sha256,
-            value_json=proposal.value_json,
-            supersedes_memory_id=proposal.supersedes_memory_id,
-        )
         with write_transaction(self.connection):
-            cursor = self.connection.execute(
-                "INSERT INTO memory_records(memory_id, project_id, run_id, plan_revision, layer, kind, "
-                "status, subject_id, predicate, value_json, source_artifact_id, "
-                "source_artifact_revision, source_span, source_hash, confidence, created_by, created_at, "
-                "supersedes_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(memory_id) DO NOTHING",
-                (
-                    promoted.memory_id,
-                    proposal.project_id.root,
-                    proposal.run_id,
-                    proposal.plan_revision,
-                    proposal.target_layer.value,
-                    proposal.kind.value,
-                    record_status(proposal.target_layer),
-                    subject_id,
-                    proposal.predicate,
-                    proposal.value_json,
-                    proposal.source_artifact_id.root,
-                    proposal.source_artifact_revision,
-                    promoted.source_span,
-                    evidence.source_span_sha256,
-                    proposal.confidence,
-                    "memory-governance:v1",
-                    proposal.created_at.isoformat(),
-                    proposal.supersedes_memory_id,
-                ),
+            identifier = insert_promoted_memory(
+                self.connection,
+                candidate_identifier=candidate.candidate_id,
+                proposal=proposal,
+                evidence=evidence,
+                chapter_number=None,
+                created_at=proposal.created_at,
+                created_by="memory-governance:v1",
             )
             self.connection.execute(
                 "UPDATE memory_candidates SET status = ? WHERE candidate_id = ?",
                 (CandidateStatus.PROMOTED.value, candidate.candidate_id),
             )
-            self.connection.execute(
-                "INSERT INTO memory_fts(memory_id, content) VALUES (?, ?)",
-                (promoted.memory_id, proposal.value_json),
-            )
-        if cursor.rowcount == 0:
-            existing = load_promoted_memory(self.connection, promoted.memory_id)
-            if existing is None:
-                raise MemoryGovernanceError(MemoryErrorCode.PROMOTION_MISSING)
-            promoted = existing
+        promoted = load_promoted_memory(self.connection, identifier)
+        if promoted is None:
+            raise MemoryGovernanceError(MemoryErrorCode.PROMOTION_MISSING)
         final_candidate = candidate.model_copy(update={"status": CandidateStatus.PROMOTED, "review_code": None})
         return MemoryPromotionResult(
             candidate=final_candidate,

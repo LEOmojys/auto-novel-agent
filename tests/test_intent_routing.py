@@ -11,7 +11,7 @@ import config
 from novel_agent.agent.brief import BriefAnalyzer, BriefContract
 from novel_agent.contracts import RunStatus
 from novel_agent.pathing import ProjectId
-from novel_agent.provider_types import ProviderTransportResult
+from novel_agent.provider_types import ProviderFailureKind, ProviderTransportError, ProviderTransportResult
 from novel_agent.service import NovelAgentService, StartNovelRunRequest
 from novel_agent.storage import connect_project_database
 
@@ -381,3 +381,65 @@ def test_creative_request_still_succeeds_when_provider_fails(
         )
     )
     assert _wait_terminal(service, project_id, "run-valid") is RunStatus.SUCCEEDED
+
+
+class _FreshTransport:
+    """Brief analysis that flags a brand-new story."""
+
+    def generate(self, request) -> ProviderTransportResult:
+        prompt = request.prompt
+        if "需求分析器" in prompt:
+            payload = {
+                "domain": "novel",
+                "intent": "full_novel",
+                "goal": "换一个全新的太空歌剧故事",
+                "constraints": [],
+                "style_guidance": [],
+                "acceptance_criteria": ["与旧故事完全不同"],
+                "fresh": True,
+            }
+        else:
+            payload = {"title": "星际", "premise": "深空。", "rules": [], "constraints": []}
+        return ProviderTransportResult(
+            content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            model_name="t",
+            prompt_tokens=1,
+            completion_tokens=1,
+        )
+
+
+def test_brief_analyzer_flags_fresh_story_from_provider() -> None:
+    brief = BriefAnalyzer(transport=_FreshTransport(), now=lambda: FIXED_TIME).analyze(
+        "换个故事，写一部太空歌剧",
+        project_id=ProjectId("novel-one"),
+        run_id="run-fresh",
+        brief_id="run-fresh:brief",
+    )
+    assert brief.fresh is True
+    assert brief.intent == "full_novel"
+
+
+class _FailingTransport:
+    def generate(self, _request) -> ProviderTransportResult:
+        raise ProviderTransportError(kind=ProviderFailureKind.TRANSIENT, detail="wire down")
+
+
+def test_brief_analyzer_fresh_fallback_on_degraded() -> None:
+    brief = BriefAnalyzer(transport=_FailingTransport(), now=lambda: FIXED_TIME).analyze(
+        "新写一本完全不同的奇幻小说，不要之前的设定",
+        project_id=ProjectId("novel-one"),
+        run_id="run-fresh2",
+        brief_id="run-fresh2:brief",
+    )
+    assert brief.fresh is True
+    assert brief.degraded is True
+
+
+def test_brief_analyzer_not_fresh_on_continuation() -> None:
+    brief = BriefAnalyzer(transport=_FailingTransport(), now=lambda: FIXED_TIME).analyze(
+        "续写第二章",
+        project_id=ProjectId("novel-one"),
+        run_id="run-cont",
+        brief_id="run-cont:brief",
+    )
+    assert brief.fresh is False

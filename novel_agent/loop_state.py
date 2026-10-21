@@ -26,6 +26,8 @@ class LoopState:
     plan_ref: tuple[str, int] | None = None  # (plan_id, revision)
     written_chapters: tuple[int, ...] = ()
     summary: str = ""
+    remaining_plan: tuple[tuple[str, dict], ...] = ()  # unexecuted plan steps (approval pause)
+    plan_index: int = 0  # steps already executed of the original plan
 
     def model_dump(self) -> dict:
         return {
@@ -36,6 +38,8 @@ class LoopState:
             "plan_ref": list(self.plan_ref) if self.plan_ref else None,
             "written_chapters": list(self.written_chapters),
             "summary": self.summary,
+            "remaining_plan": [list(step) for step in self.remaining_plan],
+            "plan_index": self.plan_index,
         }
 
 
@@ -48,6 +52,8 @@ CREATE TABLE IF NOT EXISTS loop_state (
     plan_ref_json TEXT,
     written_chapters_json TEXT NOT NULL DEFAULT '[]',
     summary TEXT NOT NULL DEFAULT '',
+    remaining_plan_json TEXT,
+    plan_index INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 )
 """
@@ -55,6 +61,12 @@ CREATE TABLE IF NOT EXISTS loop_state (
 
 def ensure_loop_state_table(connection: sqlite3.Connection) -> None:
     connection.execute(_LOOP_STATE_SCHEMA)
+    # Backfill columns for databases created before plan persistence.
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(loop_state)").fetchall()}
+    if "remaining_plan_json" not in columns:
+        connection.execute("ALTER TABLE loop_state ADD COLUMN remaining_plan_json TEXT")
+    if "plan_index" not in columns:
+        connection.execute("ALTER TABLE loop_state ADD COLUMN plan_index INTEGER NOT NULL DEFAULT 0")
 
 
 def save_loop_state(
@@ -65,11 +77,13 @@ def save_loop_state(
     ensure_loop_state_table(connection)
     connection.execute(
         "INSERT INTO loop_state(run_id, step, history_event_seq, pending_action_json, plan_ref_json, "
-        "written_chapters_json, summary, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "written_chapters_json, summary, remaining_plan_json, plan_index, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(run_id) DO UPDATE SET step = excluded.step, "
         "history_event_seq = excluded.history_event_seq, pending_action_json = excluded.pending_action_json, "
         "plan_ref_json = excluded.plan_ref_json, written_chapters_json = excluded.written_chapters_json, "
-        "summary = excluded.summary, updated_at = excluded.updated_at",
+        "summary = excluded.summary, remaining_plan_json = excluded.remaining_plan_json, "
+        "plan_index = excluded.plan_index, updated_at = excluded.updated_at",
         (
             state.run_id,
             state.step,
@@ -78,6 +92,8 @@ def save_loop_state(
             json.dumps(state.plan_ref) if state.plan_ref else None,
             json.dumps(state.written_chapters),
             state.summary,
+            json.dumps([list(step) for step in state.remaining_plan]) if state.remaining_plan else None,
+            state.plan_index,
             now.isoformat(),
         ),
     )
@@ -86,8 +102,8 @@ def save_loop_state(
 def load_loop_state(connection: sqlite3.Connection, run_id: str) -> LoopState | None:
     ensure_loop_state_table(connection)
     row = connection.execute(
-        "SELECT step, history_event_seq, pending_action_json, plan_ref_json, written_chapters_json, summary "
-        "FROM loop_state WHERE run_id = ?",
+        "SELECT step, history_event_seq, pending_action_json, plan_ref_json, written_chapters_json, summary, "
+        "remaining_plan_json, plan_index FROM loop_state WHERE run_id = ?",
         (run_id,),
     ).fetchone()
     if row is None:
@@ -102,6 +118,7 @@ def load_loop_state(connection: sqlite3.Connection, run_id: str) -> LoopState | 
             return default
 
     plan_ref = _parse(row[3], None)
+    remaining = _parse(row[6], [])
     return LoopState(
         run_id=run_id,
         step=int(row[0] or 0),
@@ -110,6 +127,11 @@ def load_loop_state(connection: sqlite3.Connection, run_id: str) -> LoopState | 
         plan_ref=tuple(plan_ref) if isinstance(plan_ref, list) and len(plan_ref) == 2 else None,
         written_chapters=tuple(int(n) for n in _parse(row[4], [])),
         summary=str(row[5] or ""),
+        remaining_plan=tuple(
+            (str(step[0]), dict(step[1])) for step in remaining
+            if isinstance(step, list) and len(step) == 2 and isinstance(step[0], str)
+        ),
+        plan_index=int(row[7] or 0),
     )
 
 

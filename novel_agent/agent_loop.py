@@ -23,6 +23,7 @@ Aligned with the codex/opencode consensus (see docs/agent-loop-risks.md):
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
 import time
@@ -198,6 +199,24 @@ def _estimate_tokens(text: str) -> int:
     return cjk + ascii_chars // 4
 
 
+def _accepts_cancellation(generate) -> bool:
+    """Whether a transport's generate() accepts an optional cancellation arg.
+
+    The ProviderTransport protocol allows it, but scripted test transports
+    keep the two-argument signature; inspect the callable to stay compatible.
+    """
+    try:
+        parameters = tuple(inspect.signature(generate).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    for parameter in parameters:
+        if parameter.name == "cancellation":
+            return True
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
+
+
 def build_loop_context(
     *,
     system_prompt: str,
@@ -269,6 +288,11 @@ class AgentLoop:
     event_sink: Callable[[str, dict[str, object]], None] | None = None
     failure_sink: Callable[[str, str], None] | None = None
     invoke: Callable[[str, dict], ToolResult] | None = None
+    cancellation: object | None = None  # optional is_cancelled() token (stage-driven)
+    # Plan state survives a run() return so the stage can persist the remaining
+    # plan across an approval pause and resume it on the next run().
+    current_plan: tuple[tuple[str, dict], ...] = ()
+    plan_index: int = 0
 
     def __post_init__(self) -> None:
         if self.invoke is None:
@@ -308,7 +332,10 @@ class AgentLoop:
         delay = self.config.retry_initial_delay_ms / 1000.0
         for attempt in range(self.config.retry_max + 1):
             try:
-                return self.transport.generate(request).content
+                generate = self.transport.generate
+                if self.cancellation is not None and _accepts_cancellation(generate):
+                    return generate(request, cancellation=self.cancellation).content
+                return generate(request).content
             except ProviderTransportError as error:
                 if self.failure_sink is not None:
                     self.failure_sink("agent_loop", str(error)[:300])
@@ -350,12 +377,18 @@ class AgentLoop:
         memory_snapshot: str = "",
         recent_artifacts: Sequence[str] = (),
         initial_history: Sequence[LoopMessage] = (),
+        initial_plan: Sequence[tuple[str, dict]] = (),
+        initial_plan_index: int = 0,
     ) -> tuple[str, list[LoopMessage]]:
         """Run the loop until done / step limit. Returns (outcome, history).
 
         ``initial_history`` resumes a previously-paused loop (approval gate /
         repair): the caller replays the persisted tool-call trace so the model
         keeps its context instead of starting from scratch.
+
+        ``initial_plan`` / ``initial_plan_index`` resume a plan that was
+        paused at an approval gate: the remaining steps are executed first
+        (auto-advance) before the model is asked to decide anything.
         """
         history: list[LoopMessage] = [LoopMessage(role="user", content=task)]
         if initial_history:
@@ -365,10 +398,12 @@ class AgentLoop:
         recent_tool_calls: list[str] = []
         total_chars = len(system_prompt) + len(task) + len(memory_snapshot)
         # Plan-Act state: the model may first emit a plan (list of steps) and
-        # then advance through it with {"next": true}, or deviate with direct
-        # tool calls / a replacement plan.
-        current_plan: list[tuple[str, dict]] = []
-        plan_index = 0
+        # the loop auto-executes it; the plan survives on the instance so an
+        # approval pause can persist and later resume the remaining steps.
+        self.current_plan = tuple(initial_plan) if initial_plan else ()
+        self.plan_index = initial_plan_index
+        current_plan: list[tuple[str, dict]] = list(self.current_plan)
+        plan_index = self.plan_index
 
         def plan_status_text() -> str:
             if not current_plan:
@@ -427,7 +462,43 @@ class AgentLoop:
                 return None
             return execute_step(tool, args)
 
+        def cancelled() -> bool:
+            return self.cancellation is not None and self.cancellation.is_cancelled()
+
+        # Resume: if a previously-paused plan remains, auto-execute the rest
+        # before asking the model anything (opencode-style continuation).
+        if initial_plan and plan_index < len(current_plan):
+            history.append(LoopMessage(
+                role="assistant",
+                content="续跑剩余计划：" + " → ".join(tool for tool, _args in current_plan[plan_index:]),
+            ))
+            while plan_index < len(current_plan):
+                if cancelled():
+                    return "cancelled", tuple(history)
+                tool, args = current_plan[plan_index]
+                plan_index += 1
+                self.plan_index = plan_index
+                result = run_tool(tool, args)
+                if result is None:
+                    break
+                if not result.ok:
+                    break
+                if result.requires_approval:
+                    self.current_plan = tuple(current_plan)
+                    if self.event_sink is not None:
+                        self.event_sink("loop_waiting_approval", {"tool": tool})
+                    return "waiting_approval", tuple(history)
+            if plan_index >= len(current_plan):
+                history.append(LoopMessage(
+                    role="assistant",
+                    content="当前计划已全部执行完。若任务完成请输出 {\"done\": true}；否则输出新的 plan。",
+                ))
+
         for step in range(self.config.max_steps):
+            if cancelled():
+                if self.event_sink is not None:
+                    self.event_sink("loop_cancelled", {})
+                return "cancelled", tuple(history)
             if self.event_sink is not None:
                 self.event_sink("loop_step", {"step": step})
             # Compaction: when the accumulated history exceeds the threshold,
@@ -476,14 +547,20 @@ class AgentLoop:
             if action is None:
                 history.append(LoopMessage(role="assistant", content=f"（无法解析的响应，请输出合法 JSON）"))
                 continue
+            if cancelled():
+                if self.event_sink is not None:
+                    self.event_sink("loop_cancelled", {})
+                return "cancelled", tuple(history)
             if action.kind == "done":
                 if self.event_sink is not None:
                     self.event_sink("loop_done", {"reply": action.thought or ""})
                 return "done", tuple(history)
 
-            # Plan-Act: the model plans first; the loop executes the plan steps
-            # in order on {"next": true}. Direct tool calls or a replacement
-            # plan stay allowed so the model keeps control (opencode-style).
+            # Plan-Act: the model plans first; the loop then AUTOMATICALLY
+            # executes the plan steps in order (opencode-style), pausing only
+            # for approval gates, blocked/failed steps that need a decision,
+            # or when the plan is exhausted. The model stays in control via
+            # {"next": true}, replacement plans, direct tool calls, or done.
             if action.kind == "plan":
                 valid = [(tool, args) for tool, args in action.plan if tool in self.tools]
                 if not valid:
@@ -493,36 +570,65 @@ class AgentLoop:
                     ))
                     continue
                 current_plan[:] = valid
-                plan_index = 1
+                plan_index = 0
                 if self.event_sink is not None:
                     self.event_sink("loop_plan", {"steps": ";".join(tool for tool, _args in valid)})
                 history.append(LoopMessage(
                     role="assistant",
                     content="执行计划：" + " → ".join(tool for tool, _args in valid),
                 ))
-                # Plan first, act immediately: execute the first step now.
-                result = run_tool(valid[0][0], valid[0][1])
-                if result is None:
-                    continue
-                if result.requires_approval:
-                    if self.event_sink is not None:
-                        self.event_sink("loop_waiting_approval", {"tool": valid[0][0]})
-                    return "waiting_approval", tuple(history)
-                continue
-
-            # Advance the active plan: execute its next pending step.
-            if action.kind == "next":
-                if plan_index < len(current_plan):
+                # Auto-advance: run the plan steps in order; pause only for
+                # approval gates, doom-blocked steps, failed steps, or when
+                # the plan is exhausted (each step's result is still recorded
+                # in history as the model's observation).
+                interrupted = False
+                while plan_index < len(current_plan):
+                    if cancelled():
+                        return "cancelled", tuple(history)
                     tool, args = current_plan[plan_index]
                     plan_index += 1
+                    self.plan_index = plan_index
                     result = run_tool(tool, args)
-                    if result is None:
-                        continue
+                    if result is None:  # doom-blocked: needs a model decision
+                        interrupted = True
+                        break
+                    if not result.ok:  # failed step: needs a model decision
+                        interrupted = True
+                        break
                     if result.requires_approval:
+                        self.current_plan = tuple(current_plan)
                         if self.event_sink is not None:
                             self.event_sink("loop_waiting_approval", {"tool": tool})
                         return "waiting_approval", tuple(history)
-                else:
+                if not interrupted and plan_index >= len(current_plan):
+                    history.append(LoopMessage(
+                        role="assistant",
+                        content="当前计划已全部执行完。若任务完成请输出 {\"done\": true}；否则输出新的 plan。",
+                    ))
+                continue
+
+            # Advance the active plan: auto-run the remaining steps.
+            if action.kind == "next":
+                interrupted = False
+                while plan_index < len(current_plan):
+                    if cancelled():
+                        return "cancelled", tuple(history)
+                    tool, args = current_plan[plan_index]
+                    plan_index += 1
+                    self.plan_index = plan_index
+                    result = run_tool(tool, args)
+                    if result is None:
+                        interrupted = True
+                        break
+                    if not result.ok:
+                        interrupted = True
+                        break
+                    if result.requires_approval:
+                        self.current_plan = tuple(current_plan)
+                        if self.event_sink is not None:
+                            self.event_sink("loop_waiting_approval", {"tool": tool})
+                        return "waiting_approval", tuple(history)
+                if not interrupted and plan_index >= len(current_plan):
                     history.append(LoopMessage(
                         role="assistant",
                         content="当前计划已全部执行完。若任务完成请输出 {\"done\": true}；否则输出新的 plan。",

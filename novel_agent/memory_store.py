@@ -189,6 +189,29 @@ def _source_status(value: str) -> SourceArtifactStatus:
         raise MemoryGovernanceError(MemoryErrorCode.SOURCE_NOT_ELIGIBLE) from None
 
 
+def index_memory(
+    connection: sqlite3.Connection,
+    memory_identifier: str,
+    content: str,
+) -> None:
+    """Index one promoted memory exactly once (idempotent).
+
+    The FTS table has no unique constraint on `memory_id`, so retried commits
+    must not append duplicate rows: the INSERT is guarded by a NOT EXISTS probe.
+    """
+    connection.execute(
+        "INSERT INTO memory_fts(memory_id, content) SELECT ?, ? WHERE NOT EXISTS "
+        "(SELECT 1 FROM memory_fts WHERE memory_id = ?)",
+        (memory_identifier, content, memory_identifier),
+    )
+
+
+def delete_memory_index(connection: sqlite3.Connection, memory_ids: tuple[str, ...]) -> None:
+    """Drop derived FTS rows for memories that are being deleted."""
+    for identifier in memory_ids:
+        connection.execute("DELETE FROM memory_fts WHERE memory_id = ?", (identifier,))
+
+
 def rebuild_retrieval_index(connection: sqlite3.Connection, project_id: str) -> int:
     """Rebuild the derived M4 FTS index from current memory records.
 
@@ -200,15 +223,15 @@ def rebuild_retrieval_index(connection: sqlite3.Connection, project_id: str) -> 
         "SELECT memory_id, value_json FROM memory_records WHERE project_id = ?",
         (project_id,),
     ).fetchall()
-    connection.executemany(
-        "INSERT INTO memory_fts(memory_id, content) VALUES (?, ?)",
-        ((str(row[0]), str(row[1])) for row in rows),
-    )
+    for row in rows:
+        index_memory(connection, str(row[0]), str(row[1]))
     return len(rows)
 
 
 __all__ = (
     "ArtifactSource",
+    "delete_memory_index",
+    "index_memory",
     "MemoryErrorCode",
     "MemoryGovernanceError",
     "build_evidence",

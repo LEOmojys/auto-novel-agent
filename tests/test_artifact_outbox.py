@@ -329,3 +329,65 @@ def test_stale_outbox_target_outside_governed_path_is_rejected(tmp_path: Path) -
     assert "outbox_target_mismatch" in state[2]
     assert legacy_target.exists() is False
     assert receipt.target_path.exists() is False
+
+
+def test_scheduler_drains_committed_outbox(tmp_path, monkeypatch) -> None:
+    """The scheduler materializes pending outbox rows into .governed/artifacts."""
+    import hashlib
+
+    import config
+    from novel_agent.artifacts import enqueue_materialization
+    from novel_agent.local_run_scheduler import LocalRunScheduler
+    from novel_agent.pathing import (
+        ArtifactExtension,
+        ArtifactId,
+        ArtifactName,
+        ProjectId,
+        ProjectPathResolver,
+    )
+    from tests.test_workflow_gateway import FIXED_TIME
+
+    projects_root = tmp_path / "projects"
+    project_root = projects_root / "novel-one"
+    project_root.mkdir(parents=True)
+    monkeypatch.setattr(config, "PROJECTS_DIR", str(projects_root))
+    connection_context = connect_project_database(project_root)
+    connection = connection_context.__enter__()
+    try:
+        migrate(connection)
+        raw = b'{"body":"materialize me"}'
+        digest = hashlib.sha256(raw).hexdigest()
+        connection.execute(
+            "INSERT INTO artifacts(artifact_id, revision, project_id, run_id, kind, status, raw_bytes, "
+            "sha256, schema_version, is_current, created_at) VALUES ('a1', 1, 'novel-one', NULL, "
+            "'chapter', 'accepted', ?, ?, 1, 1, ?)",
+            (raw, digest, FIXED_TIME.isoformat()),
+        )
+        enqueue_materialization(
+            connection,
+            project_id="novel-one",
+            artifact_id="a1",
+            revision=1,
+            raw_bytes=raw,
+            created_at=FIXED_TIME,
+        )
+        assert connection.execute(
+            "SELECT state FROM artifact_outbox WHERE artifact_id = 'a1'"
+        ).fetchone() == ("pending",)
+
+        LocalRunScheduler._sync_exports(connection, ProjectId("novel-one"))
+
+        assert connection.execute(
+            "SELECT state FROM artifact_outbox WHERE artifact_id = 'a1'"
+        ).fetchone() == ("materialized",)
+        target = ProjectPathResolver.from_config().resolve_export(
+            ProjectId("novel-one"),
+            ArtifactName(
+                artifact_id=ArtifactId("a1"),
+                content_hash=digest,
+                extension=ArtifactExtension.JSON,
+            ),
+        )
+        assert target.read_bytes() == raw
+    finally:
+        connection_context.__exit__(None, None, None)

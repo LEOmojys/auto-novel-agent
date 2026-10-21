@@ -1371,7 +1371,7 @@ def _merge_sqlite_assets(assets: dict[str, object], connection) -> None:
     try:
         rows = connection.execute(
             "SELECT kind, value_json FROM memory_records "
-            "WHERE layer = 'm1_canonical' AND status = 'validated' "
+            "WHERE layer = 'm1_canonical' AND status IN ('canonical', 'validated') "
             "AND kind IN ('world_rule', 'character_identity') "
             "ORDER BY created_at DESC, rowid DESC"
         ).fetchall()
