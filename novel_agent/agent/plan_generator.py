@@ -19,7 +19,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from novel_agent.agent.brief import BriefContract
+from novel_agent.agent.brief import BriefContract, intent_capabilities
 from novel_agent.contracts import Provenance, ProvenanceKind, ProviderRequest
 from novel_agent.provider_types import ProviderTransport, ProviderTransportError
 
@@ -36,6 +36,10 @@ _PLAN_PROMPT: str = """你是 Plan-and-Execute 架构中的规划器。请将用
 
 ## 用户需求（已分析）
 {requirements}
+
+## 意图
+主意图：{intent}
+全部交付意图：{intents}
 
 ## 已有设定（可直接复用，无需重新生成）
 {existing}
@@ -189,14 +193,25 @@ class PlanGenerator:
     model_name: str = "deepseek-v4-pro"
     prompt: str | None = None
     existing_summary: str | None = None
+    existing_world: bool | None = None
+    existing_cast: bool | None = None
+    existing_outline: bool | None = None
     failure_holder: dict[str, str] | None = None
     failure_sink: Callable[[str, str, str, str, str], None] | None = None
     call_event_sink: Callable[[str, str, str], None] | None = None
     plan_sink: Callable[[ExecutionPlan], None] | None = None
 
     def generate(self, brief: BriefContract) -> ExecutionPlan | None:
+        intents = tuple(
+            dict.fromkeys(
+                ([brief.intent] if brief.intent != "unrecognized" else [])
+                + list(brief.intents or ())
+            )
+        ) or (brief.intent,)
         prompt = (self.prompt or _PLAN_PROMPT).format(
             requirements=brief.raw_requirements,
+            intent=brief.intent,
+            intents=", ".join(intents),
             existing=self.existing_summary or "（项目暂无已有设定）",
             available_tools="\n".join(f"- {tool}" for tool in AVAILABLE_PLAN_TOOLS),
         )
@@ -254,15 +269,26 @@ class PlanGenerator:
             self._record_failure("schema", request, repr(raw[:400]))
             return None
         existing = self.existing_summary or ""
-        existing_world = "世界观《" in existing
-        existing_cast = "已有角色" in existing
-        existing_outline = "已有大纲" in existing
+        existing_world = (
+            self.existing_world
+            if self.existing_world is not None
+            else "世界观《" in existing
+        )
+        existing_cast = (
+            self.existing_cast if self.existing_cast is not None else "已有角色" in existing
+        )
+        existing_outline = (
+            self.existing_outline
+            if self.existing_outline is not None
+            else "已有大纲" in existing
+        )
         plan = _ensure_plan_prerequisites(
             plan,
             existing_world=existing_world,
             existing_cast=existing_cast,
             existing_outline=existing_outline,
             intent=brief.intent,
+            intents=intents,
             requirements=brief.raw_requirements,
         )
         violations = validate_execution_plan(
@@ -298,6 +324,7 @@ def _ensure_plan_prerequisites(
     existing_cast: bool,
     existing_outline: bool = False,
     intent: str | None = None,
+    intents: tuple[str, ...] | None = None,
     requirements: str = "",
 ) -> ExecutionPlan:
     """Repair a model-produced plan before validation.
@@ -320,6 +347,7 @@ def _ensure_plan_prerequisites(
     steps = _trim_to_intent(
         steps,
         intent=intent,
+        intents=intents,
         existing_world=existing_world,
         existing_cast=existing_cast,
         existing_outline=existing_outline,
@@ -361,6 +389,7 @@ def _trim_to_intent(
     steps: tuple[PlanStep, ...],
     *,
     intent: str | None,
+    intents: tuple[str, ...] | None = None,
     existing_world: bool,
     existing_cast: bool,
     existing_outline: bool = False,
@@ -380,7 +409,49 @@ def _trim_to_intent(
     of them.  Those regeneration steps are dropped so the run only drafts the
     requested chapter(s); the graph then reuses the accepted assets.
     """
-    if intent == "outline_only":
+    requested = tuple(intents or (() if not intent else (intent,)))
+    if len(requested) > 1:
+        if "full_novel" in requested:
+            return steps
+        capability_tools = {
+            "world": "world.generate@1.0.0",
+            "cast": ("character.generate@1.0.0", "character.revise@1.0.0"),
+            "outline": "outline.generate@1.0.0",
+            "chapters": "chapter.draft@1.0.0",
+            "add_character": ("character.generate@1.0.0", "character.revise@1.0.0"),
+        }
+        allowed: set[str] = set()
+        for capability in intent_capabilities(requested):
+            value = capability_tools.get(capability)
+            if isinstance(value, tuple):
+                allowed.update(value)
+            elif value is not None:
+                allowed.add(value)
+        filtered = tuple(step for step in steps if step.tool in allowed)
+        if existing_world and any(step.tool != "world.generate@1.0.0" for step in filtered):
+            filtered = tuple(step for step in filtered if step.tool != "world.generate@1.0.0")
+        return filtered
+    if intent == "world_only":
+        steps = tuple(step for step in steps if step.tool == "world.generate@1.0.0")
+    elif intent == "characters_only":
+        steps = tuple(
+            step
+            for step in steps
+            if step.tool in (
+                "world.generate@1.0.0",
+                "character.generate@1.0.0",
+                "character.revise@1.0.0",
+            )
+        )
+        if existing_world:
+            steps = tuple(step for step in steps if step.tool != "world.generate@1.0.0")
+    elif intent == "add_character":
+        steps = tuple(
+            step
+            for step in steps
+            if step.tool in ("character.generate@1.0.0", "character.revise@1.0.0")
+        )
+    elif intent == "outline_only":
         steps = tuple(step for step in steps if step.tool != "chapter.draft@1.0.0")
         if existing_world:
             steps = tuple(step for step in steps if step.tool != "world.generate@1.0.0")

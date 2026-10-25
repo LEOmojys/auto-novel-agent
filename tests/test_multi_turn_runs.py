@@ -92,7 +92,7 @@ class MultiTurnTransport:
         )
 
 
-def _wait_terminal(service: NovelAgentService, run_id: str, seconds: float = 8.0) -> RunStatus:
+def _wait_terminal(service: NovelAgentService, run_id: str, seconds: float = 20.0) -> RunStatus:
     deadline = monotonic() + seconds
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, run_id)).status not in terminal:

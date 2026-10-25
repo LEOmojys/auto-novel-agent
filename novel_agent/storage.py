@@ -15,6 +15,8 @@ from novel_agent.migrations.v4_tool_call_results import TOOL_CALL_RESULT_SCHEMA_
 from novel_agent.migrations.v5_m4_retrieval import M4_RETRIEVAL_SCHEMA_STATEMENTS
 from novel_agent.migrations.v6_provider_failures import PROVIDER_FAILURE_SCHEMA_STATEMENTS
 from novel_agent.migrations.v7_memory_completion import MEMORY_COMPLETION_SCHEMA_STATEMENTS
+from novel_agent.migrations.v8_tool_call_retry import TOOL_CALL_RETRY_SCHEMA_STATEMENTS
+from novel_agent.migrations.v9_loop_operations import LOOP_OPERATION_SCHEMA_STATEMENTS
 from novel_agent.sqlite_transactions import TransactionStateError, write_transaction
 from novel_agent.tool_call_ledger import (
     ToolCallLedgerWrite,
@@ -25,7 +27,7 @@ from novel_agent.tool_call_ledger import (
 )
 
 DATABASE_FILENAME: Final = "agent.sqlite"
-CURRENT_SCHEMA_VERSION: Final = 7
+CURRENT_SCHEMA_VERSION: Final = 9
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +98,16 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
         version=7,
         name="memory_completion",
         statements=MEMORY_COMPLETION_SCHEMA_STATEMENTS,
+    ),
+    Migration(
+        version=8,
+        name="tool_call_retry",
+        statements=TOOL_CALL_RETRY_SCHEMA_STATEMENTS,
+    ),
+    Migration(
+        version=9,
+        name="loop_operation_journal",
+        statements=LOOP_OPERATION_SCHEMA_STATEMENTS,
     ),
 )
 

@@ -36,8 +36,20 @@ _EVALUATION_PROMPT: str = """你是一位苛刻的小说评审编辑。请评估
 ## 章节要求
 {beats}
 
-## 角色
+## 风格要求
+{style}
+
+## 世界观约束
+{world}
+
+## 验收标准
+{acceptance}
+
+## 角色设定
 {characters}
+
+## 前文摘要
+{previous}
 
 ## 章节正文
 {body}
@@ -69,14 +81,21 @@ class ProviderStructuredEvaluator:
 
     def evaluate(self, request: EvaluatorAdapterRequest) -> str:
         characters_text = "\n".join(
-            f"- {fixture.name}（{'/'.join(fixture.aliases) if fixture.aliases else '无别名'}）"
-            for fixture in request.characters
+            _format_character(fixture) for fixture in request.characters
         ) or "（无角色信息）"
         beats_text = "\n".join(f"- {beat}" for beat in request.required_beats) or "（无明确事件要求）"
+        style_text = "\n".join(f"- {item}" for item in request.style_guidance) or "（无额外风格要求）"
+        world_text = "\n".join(f"- {item}" for item in request.world_rules) or "（无额外世界观约束）"
+        acceptance_text = "\n".join(f"- {item}" for item in request.acceptance_criteria) or "（无额外验收标准）"
+        previous_text = request.previous_summary.strip() or "（无前文摘要）"
         template = self.prompt or _EVALUATION_PROMPT
         prompt = template.format(
             beats=beats_text,
+            style=style_text,
+            world=world_text,
+            acceptance=acceptance_text,
             characters=characters_text,
+            previous=previous_text,
             body=request.body[:8_000],
         )
         timestamp = self.now()
@@ -127,6 +146,18 @@ class ProviderStructuredEvaluator:
                     prompt_sha256=provider_request.prompt_sha256,
                 )
             return ""
+
+
+def _format_character(fixture: CharacterFixture) -> str:
+    aliases = "/".join(fixture.aliases) if fixture.aliases else "无别名"
+    details: list[str] = [f"别名 {aliases}"]
+    if fixture.role:
+        details.append(f"定位 {fixture.role}")
+    if fixture.goal:
+        details.append(f"目标 {fixture.goal}")
+    if fixture.traits:
+        details.append("性格 " + "、".join(fixture.traits))
+    return f"- {fixture.name}（" + "；".join(details) + "）"
 
 
 @dataclass(frozen=True, slots=True)

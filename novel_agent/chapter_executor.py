@@ -43,6 +43,7 @@ from novel_agent.provider_types import ProviderFailureKind, ProviderTransportErr
 from novel_agent.quality import ChapterQualityRequest, QualityDecision, QualityOutcome
 from novel_agent.run_models import RunLease
 from novel_agent.skills import SkillCatalog
+from novel_agent.tool_runtime import check_tool_active
 from novel_agent.tool_models import AgentRole, ToolInvocationRequest
 from novel_agent.tool_registry import ToolCallResult, ToolGateway
 from novel_agent.workflow_tools import (
@@ -333,6 +334,7 @@ def execute_single_chapter(
     current_brief: RepairBrief | None = None
     repair_attempt = 0
     while True:
+        check_tool_active()
         if workflow.coordinator.cancellation_requested(lease):
             workflow.coordinator.cancel_chapter(lease, task_id)
             return ChapterExecutionCancelled(task_id)
@@ -348,6 +350,7 @@ def execute_single_chapter(
                 return workflow._pause(lease, task_id, "chapter_schema_failure")
             case unreachable:
                 assert_never(unreachable)
+        check_tool_active()
         staged = workflow.coordinator.stage_chapter(
             lease,
             ChapterStageRequest(
@@ -406,6 +409,7 @@ def execute_single_chapter(
                 if workflow.coordinator.cancellation_requested(lease):
                     workflow.coordinator.cancel_chapter(lease, task_id)
                     return ChapterExecutionCancelled(task_id)
+                check_tool_active()
                 if not request.auto_approve:
                     # Approval mode: keep the chapter staged and pause the run
                     # so the console user can review, edit, or regenerate it
@@ -441,7 +445,14 @@ def execute_single_chapter(
                 if repair_attempt >= workflow.policy.maximum_repairs:
                     return workflow._pause(lease, task_id, "repair_budget_exhausted")
                 repair_attempt += 1
-                current_brief = repair_brief(chapter, repair_attempt, decision.reason_codes, context, staged)
+                current_brief = repair_brief(
+                    chapter,
+                    repair_attempt,
+                    decision.reason_codes,
+                    decision.feedback,
+                    context,
+                    staged,
+                )
             case QualityOutcome.PAUSE | QualityOutcome.EVALUATOR_ERROR:
                 reason = decision.reason_codes[0] if decision.reason_codes else "quality_review_failed"
                 return workflow._pause(lease, task_id, reason)

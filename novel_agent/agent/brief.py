@@ -32,10 +32,78 @@ _DEFAULT_INTENT: str = "full_novel"
 #: instead of silently treating chatter/gibberish as a full-novel request.
 _INTENT_UNRECOGNIZED: str = "unrecognized"
 _DEFAULT_CHAPTER_COUNT: int = 10
+_SUPPORTED_INTENTS: frozenset[str] = frozenset(
+    (
+        "full_novel",
+        "characters_only",
+        "world_only",
+        "outline_only",
+        "add_character",
+        "unrecognized",
+    )
+)
+INTENT_CAPABILITIES: dict[str, tuple[str, ...]] = {
+    "world_only": ("world",),
+    "characters_only": ("world", "cast"),
+    "outline_only": ("world", "cast", "outline"),
+    "full_novel": ("world", "cast", "outline", "chapters"),
+    "add_character": ("add_character",),
+}
+
+
+_ONLY_WORLD = re.compile(r"(?:只|仅|只要|单单)(?:写|要|生成|设定|设计)?(?:世界观|世界设定|背景设定|背景)")
+_ONLY_CAST = re.compile(r"(?:只|仅|只要|单单)(?:写|要|生成|设计)?(?:角色|人物)")
+_ONLY_OUTLINE = re.compile(r"(?:只|仅|只要|单单)(?:写|要|生成|设计)?(?:大纲|故事大纲|章节规划)")
+_NO_CHAPTER = re.compile(r"(?:不要|不写|无需|不用|别)(?:写)?(?:正文|章节|正文内容|章节内容)")
+_NO_OUTLINE = re.compile(r"(?:不要|不写|无需|不用|别)(?:写)?(?:大纲|故事大纲|章节规划)")
+
+
+def detect_intent_conflicts(requirements: str, intents: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    """Return explicit intent conflicts that require a user decision.
+
+    Composite intents are normally valid (e.g. cast + outline).  A conflict is
+    only raised when the request contains an explicit exclusivity phrase
+    ("只写世界观", "不要章节") that contradicts the analysed deliverables.
+    """
+    text = requirements or ""
+    capabilities = set(intent_capabilities(intents))
+    conflicts: list[str] = []
+    if _ONLY_WORLD.search(text) and capabilities - {"world"}:
+        conflicts.append("only_world_contradicts_downstream")
+    if _ONLY_CAST.search(text) and capabilities & {"outline", "chapters"}:
+        conflicts.append("only_cast_contradicts_outline_or_chapters")
+    if _ONLY_OUTLINE.search(text) and "chapters" in capabilities:
+        conflicts.append("only_outline_contradicts_chapters")
+    if _NO_CHAPTER.search(text) and "chapters" in capabilities:
+        conflicts.append("no_chapter_contradicts_chapters")
+    if _NO_OUTLINE.search(text) and "outline" in capabilities:
+        conflicts.append("no_outline_contradicts_outline")
+    return tuple(dict.fromkeys(conflicts))
+
+
+def _clarification_question(conflicts: tuple[str, ...]) -> str:
+    detail = "；".join(conflicts)
+    return (
+        f"检测到意图冲突（{detail}）。请确认你要的交付范围："
+        "1) 只按当前限制生成；2) 继续完整小说流程。"
+        "回复新的需求后我会重新规划。"
+    )
+
+
+def intent_capabilities(intents: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    ordered = ("world", "cast", "outline", "add_character", "chapters")
+    available: set[str] = set()
+    for intent in intents or ():
+        available.update(INTENT_CAPABILITIES.get(intent, ()))
+    return tuple(item for item in ordered if item in available)
 _CHAPTER_COUNT_PATTERN = re.compile(r"(\d+)\s*章")
+_CHINESE_CHAPTER_PATTERN = re.compile(r"([零〇一二两三四五六七八九十百]+)\s*章")
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 
 _INTENT_HINTS: str = (
-    '"intent": 用户意图，仅从以下取值中选择：'
+    '"intents": 用户要求的全部交付意图数组（可多选，按主次排列）；单意图时只含一个元素。取值同上。'
+    '"intent": 主意图（与 intents 第一项一致）：'
     '"full_novel"（写一部完整小说，含世界观/角色/大纲/章节），'
     '"characters_only"（只设计角色/角色卡），'
     '"world_only"（只设定世界观/背景），'
@@ -78,6 +146,8 @@ _ANALYSIS_PROMPT: str = """你是一个需求分析器。请分析用户的创�
   "style_guidance": ["风格指引，2-5条；如第一人称、文风参考、篇幅偏好"],
   "acceptance_criteria": ["验收标准，2-5条；如何判断创作符合需求"],
   "chapter_count": 章节数（用户未指定则省略此字段，由系统默认）,
+  "target_words": 单章目标字数（用户说"每章5000字"时填 5000；未指定则省略）,
+
   {intent_hints}
   "fresh": 是否要求全新故事（true：用户明确要"换一个/新写一个/全新/不同于之前"的故事，此时不要沿用已有世界观/角色/大纲；false：续写或基于已有设定；用户未提则省略或 false）
 }}
@@ -93,6 +163,7 @@ class BriefContract(BaseModel):
     raw_requirements: str
     domain: str = _DEFAULT_DOMAIN
     intent: str = _DEFAULT_INTENT
+    intents: tuple[str, ...] = ()
     degraded: bool = False
     degraded_reason: str | None = None
     degraded_detail: str | None = None
@@ -101,7 +172,11 @@ class BriefContract(BaseModel):
     style_guidance: tuple[str, ...] = ()
     acceptance_criteria: tuple[str, ...] = ()
     target_chapter_count: int | None = None
+    target_words: int | None = None
     fresh: bool = False  # True: a brand-new story; do not reuse existing assets
+    intent_conflicts: tuple[str, ...] = ()
+    needs_clarification: bool = False
+    clarification_question: str | None = None
     created_at: datetime
     provenance: Provenance
 
@@ -112,10 +187,12 @@ class _AnalysisContent(BaseModel):
     domain: str = _DEFAULT_DOMAIN
     intent: Literal["full_novel", "characters_only", "world_only", "outline_only", "add_character", "unrecognized"] = _DEFAULT_INTENT
     goal: str
+    intents: tuple[str, ...] = ()
     constraints: tuple[str, ...] = ()
     style_guidance: tuple[str, ...] = ()
     acceptance_criteria: tuple[str, ...] = ()
     chapter_count: int | None = None
+    target_words: int | None = None
     fresh: bool = False
 
 
@@ -147,9 +224,32 @@ class BriefAnalyzer:
         content, degraded_reason, degraded_detail = self._analyze_content(requirements, run_id)
         if content is not None:
             chapter_count = explicit_chapter_count or content.chapter_count
-            goal = content.goal
+            goal = content.goal.strip() or _fallback_goal(requirements)
+            if chapter_count is not None and not 1 <= chapter_count <= 200:
+                chapter_count = None
+            target_words = content.target_words
+            if target_words is not None and not 300 <= target_words <= 30_000:
+                target_words = None
             domain = content.domain
-            intent = content.intent
+            raw_intents = content.intents or ((content.intent,) if content.intent else ())
+            if not content.intents and content.intent != _INTENT_UNRECOGNIZED:
+                heuristic = _heuristic_intents(requirements)
+                if len(heuristic) > 1:
+                    # The provider sometimes returns only the primary intent for
+                    # an explicitly compound request ("design a cast and draft
+                    # chapter 1").  Add the deterministic multi-intent matches.
+                    raw_intents = (content.intent, *heuristic)
+            intents = tuple(
+                item for item in dict.fromkeys(raw_intents) if item in _SUPPORTED_INTENTS
+            )
+            if not intents:
+                intents = (content.intent,)
+            if content.intent != _INTENT_UNRECOGNIZED and content.intent not in intents:
+                intents = (content.intent, *intents)
+            if len(intents) > 1 and _INTENT_UNRECOGNIZED in intents:
+                intents = tuple(item for item in intents if item != _INTENT_UNRECOGNIZED)
+            intent = _primary_intent(intents, preferred=content.intent)
+            intent_conflicts = detect_intent_conflicts(requirements, intents)
             constraints = content.constraints
             style_guidance = content.style_guidance
             acceptance_criteria = content.acceptance_criteria
@@ -157,23 +257,27 @@ class BriefAnalyzer:
             degraded = False
         else:
             chapter_count = explicit_chapter_count
+            target_words = _parse_target_words(requirements)
             goal = _fallback_goal(requirements)
             domain = _DEFAULT_DOMAIN
-            intent = _heuristic_intent(requirements) or _INTENT_UNRECOGNIZED
+            heuristic = _heuristic_intents(requirements)
+            intents = heuristic or (_INTENT_UNRECOGNIZED,)
+            intent = _primary_intent(intents, preferred=intents[0])
+            intent_conflicts = detect_intent_conflicts(requirements, intents)
             constraints = ()
             style_guidance = ()
             acceptance_criteria = ()
             fresh = _is_fresh_story(requirements)
             degraded = True
         if chapter_count is None:
-            matched = _CHAPTER_COUNT_PATTERN.search(requirements)
-            chapter_count = int(matched.group(1)) if matched else _DEFAULT_CHAPTER_COUNT
+            chapter_count = _parse_chapter_count(requirements)
         return BriefContract(
             brief_id=brief_id,
             project_id=project_id,
             raw_requirements=requirements,
             domain=domain,
             intent=intent,
+            intents=intents,
             degraded=degraded,
             degraded_reason=degraded_reason,
             degraded_detail=degraded_detail,
@@ -182,7 +286,11 @@ class BriefAnalyzer:
             style_guidance=style_guidance,
             acceptance_criteria=acceptance_criteria,
             target_chapter_count=chapter_count,
+            target_words=target_words,
             fresh=fresh,
+            intent_conflicts=intent_conflicts,
+            needs_clarification=bool(intent_conflicts),
+            clarification_question=_clarification_question(intent_conflicts) if intent_conflicts else None,
             created_at=timestamp,
             provenance=Provenance(
                 source_kind=ProvenanceKind.USER_REQUEST,
@@ -288,6 +396,44 @@ def _strip_code_fence(raw_text: str) -> str:
     return text.strip()
 
 
+def _parse_target_words(requirements: str) -> int | None:
+    matched = re.search(r"(?:每章|一章|每章节)?\s*(\d{3,5})\s*字", requirements)
+    if matched is None:
+        return None
+    value = int(matched.group(1))
+    return value if 300 <= value <= 30_000 else None
+
+
+def _parse_chapter_count(requirements: str) -> int:
+    matched = _CHAPTER_COUNT_PATTERN.search(requirements)
+    if matched is not None:
+        return max(1, int(matched.group(1)))
+    chinese = _CHINESE_CHAPTER_PATTERN.search(requirements)
+    if chinese is not None:
+        value = _chinese_number(chinese.group(1))
+        if value is not None and value >= 1:
+            return value
+    return _DEFAULT_CHAPTER_COUNT
+
+
+def _chinese_number(text: str) -> int | None:
+    total = 0
+    section = 0
+    number = 0
+    for character in text:
+        if character in _CN_DIGITS:
+            number = _CN_DIGITS[character]
+        elif character == "十":
+            section += (number or 1) * 10
+            number = 0
+        elif character == "百":
+            section += (number or 1) * 100
+            number = 0
+        else:
+            return None
+    return total + section + number
+
+
 def _fallback_goal(requirements: str) -> str:
     compact = " ".join(requirements.split())
     return compact[:120]
@@ -326,17 +472,36 @@ _CREATIVE_SIGNAL = re.compile(
 )
 
 
-def _heuristic_intent(requirements: str) -> str | None:
+def _heuristic_intents(requirements: str) -> tuple[str, ...]:
+    found: list[str] = []
     for pattern, intent in _INTENT_PATTERNS:
-        if pattern.search(requirements):
-            return intent
+        if pattern.search(requirements) and intent not in found:
+            found.append(intent)
+    if found:
+        return tuple(found)
     # No precise rule matched: fall back to a loose creative signal so a
     # legitimate noun-phrase request ("一个关于魔法学院的成长故事") is still
     # treated as a full novel, while chatter/gibberish with no creative
     # vocabulary at all is rejected as out-of-distribution.
     if _CREATIVE_SIGNAL.search(requirements):
-        return _DEFAULT_INTENT
-    return None
+        return (_DEFAULT_INTENT,)
+    return ()
+
+
+def _primary_intent(intents: tuple[str, ...], *, preferred: str | None = None) -> str:
+    if preferred in intents:
+        return preferred
+    priority = ("full_novel", "outline_only", "characters_only", "world_only", "add_character", "unrecognized")
+    for intent in priority:
+        if intent in intents:
+            return intent
+    return intents[0] if intents else _INTENT_UNRECOGNIZED
+
+
+def _heuristic_intent(requirements: str) -> str | None:
+    intents = _heuristic_intents(requirements)
+    return _primary_intent(intents) if intents else None
+
 
 
 __all__ = ("BriefAnalyzer", "BriefContract")

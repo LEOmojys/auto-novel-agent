@@ -16,13 +16,29 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from novel_agent.adapters import SchemaFailure
+from novel_agent.agent.brief import intent_capabilities
 from novel_agent.agent_loop import AgentTool, ToolResult
-from novel_agent.contracts import StoryBrief
+from novel_agent.contracts import RunStatus, StoryBrief, ToolOutcome
+from novel_agent.tool_models import (
+    AccessLevel,
+    AgentRole,
+    ApprovalPolicy,
+    ArtifactPolicy,
+    RetryPolicy,
+    ToolInvocationRequest,
+    ToolSpec,
+)
+from novel_agent.provider_types import ProviderFailureKind, ProviderTransportError
+from novel_agent.tool_runtime import ToolCancelledError, check_tool_active
+from novel_agent.tool_registry import ToolGateway, ToolRegistry
 from novel_agent.planning import (
     generate_cast_step,
     generate_outline_step,
@@ -213,6 +229,7 @@ def _make_write_world(ctx: NovelToolContext) -> AgentTool:
         result = generate_world_step(ctx.plugin.planning_generator, ctx.gateway, ctx.lease, brief, selected)
         if isinstance(result, SchemaFailure):
             return ToolResult(ok=False, error="世界观 schema 解析失败")
+        check_tool_active()
         if not ctx.auto_approve:
             # Approval mode: stage the artifact and pause the loop for review.
             return _commit_or_stage(ctx, "world_bible", "loop:world", result.raw.raw_bytes)
@@ -263,6 +280,7 @@ def _make_write_cast(ctx: NovelToolContext) -> AgentTool:
             result = generate_cast_step(ctx.plugin.planning_generator, ctx.gateway, ctx.lease, brief, world, selected)
         if isinstance(result, SchemaFailure):
             return ToolResult(ok=False, error="角色 schema 解析失败")
+        check_tool_active()
         if not ctx.auto_approve:
             return _commit_or_stage(ctx, "character_set", "loop:cast", result.raw.raw_bytes)
         from novel_agent.domains.novel_commit import commit_cast_only
@@ -309,6 +327,7 @@ def _make_write_outline(ctx: NovelToolContext) -> AgentTool:
         )
         if isinstance(result, SchemaFailure):
             return ToolResult(ok=False, error="大纲 schema 解析失败")
+        check_tool_active()
         plan = result.value
         if not ctx.auto_approve:
             return _commit_or_stage(ctx, "plan_contract", "loop:outline", result.raw.raw_bytes)
@@ -351,23 +370,40 @@ def _make_write_chapter(ctx: NovelToolContext) -> AgentTool:
         chapter = next((c for c in plan.chapters if c.chapter_number == chapter_number), None)
         if chapter is None:
             return ToolResult(ok=False, error=f"大纲中没有第 {chapter_number} 章（大纲共 {len(plan.chapters)} 章）。")
+        force_rewrite = bool(args.get("force_rewrite", False))
+        if not force_rewrite:
+            assets = ctx._refresh_assets() or ctx.existing_assets or {}
+            written = assets.get("written_chapters") if isinstance(assets, dict) else ()
+            if chapter_number in (written or ()):
+                existing = _accepted_chapter_artifact_id(ctx, chapter.chapter_plan_id)
+                return ToolResult(
+                    ok=True,
+                    summary=f"第 {chapter_number} 章已存在，跳过重复生成。",
+                    artifact_ref=existing,
+                )
         # A continuation run reuses a previous run's outline; the chapter staging
         # authority requires the plan to be an accepted artifact of THIS run, so
         # mirror the reused plan under the current run before writing chapters.
         plan_revision = _mirror_plan_to_run(ctx, plan, plan_revision)
-        force_rewrite = bool(args.get("force_rewrite", False))
         next_chapter = next(
             (c for c in plan.chapters if c.chapter_number == chapter_number + 1), None
         )
         from novel_agent.domains.novel import _story_brief
 
         brief = _story_brief_from_ctx(ctx)
+        world = ctx._world()
+        world_rules = (
+            tuple(world.rules) + tuple(world.constraints) if world is not None else ()
+        )
         request = ChapterExecutionRequest(
             project_id=ctx.brief.project_id,
             plan=plan,
             plan_revision=plan_revision,
-            target_chinese_characters=3000,
+            target_chinese_characters=int(getattr(ctx.brief, "target_words", None) or 3000),
             genre=brief.genre,
+            style_guidance=tuple(getattr(ctx.brief, "style_guidance", ()) or ()),
+            world_rules=world_rules,
+            acceptance_criteria=tuple(getattr(ctx.brief, "acceptance_criteria", ()) or ()),
             activate=not force_rewrite,
             auto_approve=ctx.auto_approve,
         )
@@ -404,7 +440,12 @@ def _make_write_chapter(ctx: NovelToolContext) -> AgentTool:
                 )
 
                 if isinstance(result, ChapterExecutionSucceeded):
-                    return ToolResult(ok=True, summary=f"第 {chapter_number} 章已撰写完成并入库。", artifact_ref=chapter.chapter_plan_id)
+                    artifact_ref = _accepted_chapter_artifact_id(ctx, chapter.chapter_plan_id)
+                    return ToolResult(
+                        ok=True,
+                        summary=f"第 {chapter_number} 章已撰写完成并入库。",
+                        artifact_ref=artifact_ref,
+                    )
                 if isinstance(result, ChapterExecutionWaitingReview):
                     return ToolResult(ok=True, summary=f"第 {chapter_number} 章已撰写，等待确认入库。", requires_approval=True)
                 if isinstance(result, ChapterExecutionCancelled):
@@ -429,9 +470,11 @@ def _make_write_chapter(ctx: NovelToolContext) -> AgentTool:
 
 def _make_review_chapter(ctx: NovelToolContext) -> AgentTool:
     def execute(args: dict) -> ToolResult:
-        # Light-weight: report current written chapters and the plan; the real
-        # six-dimension review runs inside chapter execution's quality gate.
-        written = ctx.existing_assets.get("written_chapters") if ctx.existing_assets else ()
+        # Status only: the real six-dimension review runs inside chapter
+        # execution's quality gate.  Refresh the asset view so a chapter just
+        # written in this run is visible immediately.
+        assets = ctx._refresh_assets() or ctx.existing_assets or {}
+        written = assets.get("written_chapters") if isinstance(assets, dict) else ()
         return ToolResult(
             ok=True,
             summary=f"已写章节：{sorted(written) if written else '无'}；大纲 {ctx._plan_summary()}。",
@@ -463,7 +506,7 @@ def _make_mem_query(ctx: NovelToolContext) -> AgentTool:
         if not hits:
             return ToolResult(ok=True, summary=f"未找到与「{query}」相关的已确认设定。")
         text = "；".join(f"{h.subject_id}: {h.content[:120]}" for h in hits)
-        return ToolResult(ok=True, summary=f"相关设定：{text}", artifact_ref=query)
+        return ToolResult(ok=True, summary=f"相关设定：{text}")
 
     return AgentTool(
         name="mem_query",
@@ -475,17 +518,290 @@ def _make_mem_query(ctx: NovelToolContext) -> AgentTool:
     )
 
 
+class LoopToolInput(BaseModel):
+    """Gateway envelope for one model-facing tool call."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    args: dict = Field(default_factory=dict)
+
+
+class LoopToolOutput(BaseModel):
+    """Typed result persisted in the tool-call ledger and fed back to the model."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    ok: bool
+    summary: str = ""
+    artifact_ref: str | None = None
+    error: str | None = None
+    requires_approval: bool = False
+    staged_artifact_id: str | None = None
+    retryable: bool = False
+
+
+class _WriteWorldArgs(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+class _WriteCastArgs(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    target_names: list[str] | None = None
+
+class _AddCharacterArgs(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str = Field(min_length=1)
+
+
+class _WriteOutlineArgs(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+class _WriteChapterArgs(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    chapter_number: int = Field(ge=1)
+    force_rewrite: bool = False
+
+class _ReviewChapterArgs(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+class _MemQueryArgs(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    query: str = Field(min_length=1)
+
+class _PlanQueryArgs(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+class _ReadChapterArgs(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    chapter_number: int = Field(ge=1)
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolGovernance:
+    tool_id: str
+    role: AgentRole
+    access: AccessLevel
+    approval: ApprovalPolicy
+    input_model: type[BaseModel]
+    timeout_seconds: float = 600.0
+
+
+_TOOL_GOVERNANCE: dict[str, _ToolGovernance] = {
+    "write_world": _ToolGovernance("novel.write-world", AgentRole.STORY_ARCHITECT, AccessLevel.STAGE_WRITE, ApprovalPolicy.COORDINATOR, _WriteWorldArgs),
+    "write_cast": _ToolGovernance("novel.write-cast", AgentRole.CAST_DESIGNER, AccessLevel.STAGE_WRITE, ApprovalPolicy.COORDINATOR, _WriteCastArgs),
+    "add_character": _ToolGovernance("novel.add-character", AgentRole.CAST_DESIGNER, AccessLevel.STAGE_WRITE, ApprovalPolicy.COORDINATOR, _AddCharacterArgs),
+    "write_outline": _ToolGovernance("novel.write-outline", AgentRole.OUTLINE_PLANNER, AccessLevel.STAGE_WRITE, ApprovalPolicy.COORDINATOR, _WriteOutlineArgs),
+    "write_chapter": _ToolGovernance("novel.write-chapter", AgentRole.CHAPTER_EXECUTOR, AccessLevel.STAGE_WRITE, ApprovalPolicy.COORDINATOR, _WriteChapterArgs),
+    "review_chapter": _ToolGovernance("novel.review-chapter", AgentRole.CONTINUITY_AUDITOR, AccessLevel.READ, ApprovalPolicy.NONE, _ReviewChapterArgs),
+    "mem_query": _ToolGovernance("novel.mem-query", AgentRole.MEMORY_EXTRACTOR, AccessLevel.READ, ApprovalPolicy.NONE, _MemQueryArgs),
+    "plan_query": _ToolGovernance("novel.plan-query", AgentRole.OUTLINE_PLANNER, AccessLevel.READ, ApprovalPolicy.NONE, _PlanQueryArgs),
+    "read_chapter": _ToolGovernance("novel.read-chapter", AgentRole.CONTINUITY_AUDITOR, AccessLevel.READ, ApprovalPolicy.NONE, _ReadChapterArgs),
+}
+
+
+def _as_output(result: ToolResult) -> LoopToolOutput:
+    return LoopToolOutput(
+        ok=result.ok,
+        summary=result.summary,
+        artifact_ref=result.artifact_ref,
+        error=result.error,
+        requires_approval=result.requires_approval,
+        staged_artifact_id=result.staged_artifact_id,
+        retryable=result.retryable,
+    )
+
+
+def _operation_key(tool_name: str, args: dict) -> str:
+    payload = json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(f"{tool_name}:{payload}".encode()).hexdigest()
+
+
+def _cached_operation(
+    ctx: NovelToolContext, tool_name: str, args: dict
+) -> ToolResult | None:
+    try:
+        row = ctx.coordinator.connection.execute(
+            "SELECT result_json FROM loop_operations WHERE run_id = ? AND operation_key = ? "
+            "AND state = 'succeeded'",
+            (ctx.lease.run_id, _operation_key(tool_name, args)),
+        ).fetchone()
+    except Exception:  # noqa: BROAD_EXCEPT_OK - old databases without v9 keep working
+        return None
+    if row is None or row[0] is None:
+        return None
+    try:
+        payload = LoopToolOutput.model_validate_json(str(row[0]))
+    except Exception:  # noqa: BROAD_EXCEPT_OK - corrupt cache is ignored
+        return None
+    return ToolResult(
+        ok=payload.ok,
+        summary=payload.summary,
+        artifact_ref=payload.artifact_ref,
+        error=payload.error,
+        requires_approval=payload.requires_approval,
+        staged_artifact_id=payload.staged_artifact_id,
+        retryable=payload.retryable,
+    )
+
+
+def _remember_operation(
+    ctx: NovelToolContext, tool_name: str, args: dict, result: ToolResult
+) -> None:
+    if not result.ok or result.requires_approval:
+        return
+    payload = LoopToolOutput(
+        ok=result.ok,
+        summary=result.summary,
+        artifact_ref=result.artifact_ref,
+        error=result.error,
+        requires_approval=result.requires_approval,
+        staged_artifact_id=result.staged_artifact_id,
+        retryable=result.retryable,
+    ).model_dump_json()
+    try:
+        ctx.coordinator.connection.execute(
+            "INSERT INTO loop_operations(run_id, operation_key, tool_name, state, result_json, created_at) "
+            "VALUES (?, ?, ?, 'succeeded', ?, ?) "
+            "ON CONFLICT(run_id, operation_key) DO UPDATE SET state='succeeded', "
+            "result_json=excluded.result_json, created_at=excluded.created_at",
+            (
+                ctx.lease.run_id,
+                _operation_key(tool_name, args),
+                tool_name,
+                payload,
+                ctx.now().isoformat(),
+            ),
+        )
+    except Exception:  # noqa: BROAD_EXCEPT_OK - journal failure must not fail the tool
+        pass
+
+
+def _governed_tool(
+    tool: AgentTool,
+    governance: _ToolGovernance,
+    gateway: ToolGateway,
+    ctx: NovelToolContext,
+) -> AgentTool:
+    """Wrap a domain handler in the shared gateway (auth/idempotency/audit).
+
+    The handler still performs the domain work; the gateway owns argument
+    validation, role/state/skill authorization, the tool-call ledger and the
+    persisted request/response hashes.  A unique idempotency nonce keeps every
+    attempt auditable instead of replaying a stale failure.
+    """
+
+    tool_ref = f"{governance.tool_id}@1.0.0"
+
+    def execute(args: dict) -> ToolResult:
+        if governance.access is AccessLevel.STAGE_WRITE:
+            cached = _cached_operation(ctx, tool.name, args)
+            if cached is not None:
+                return cached
+        nonce = uuid.uuid4().hex
+        request = ToolInvocationRequest(
+            invocation_id=f"{ctx.lease.run_id}:loop:{tool.name}:{nonce}",
+            run_id=ctx.lease.run_id,
+            tool_ref=tool_ref,
+            idempotency_key=f"{ctx.lease.run_id}:loop:{tool.name}:{nonce}",
+            actor_role=governance.role,
+            skill_ref="loop@1.0.0",
+            run_status=RunStatus.RUNNING,
+            input_data=LoopToolInput(args=args),
+            # The novel tools stage artifacts for post-execution approval; the
+            # gateway approval flag is therefore granted here and the actual
+            # pause is signalled by ToolResult.requires_approval.
+            approval_granted=True,
+        )
+        check_tool_active()
+        result = gateway.invoke(request)
+        if governance.access is AccessLevel.READ:
+            check_tool_active()
+        if result.outcome is ToolOutcome.SUCCEEDED and isinstance(result.data, LoopToolOutput):
+            mapped = ToolResult(
+                ok=result.data.ok,
+                summary=result.data.summary,
+                artifact_ref=result.data.artifact_ref,
+                error=result.data.error,
+                requires_approval=result.data.requires_approval,
+                staged_artifact_id=result.data.staged_artifact_id,
+                retryable=result.data.retryable,
+            )
+            if governance.access is AccessLevel.STAGE_WRITE:
+                _remember_operation(ctx, tool.name, args, mapped)
+            return mapped
+        return ToolResult(ok=False, error=f"工具调用被拒绝/失败：{result.reason or 'TOOL_FAILED'}")
+
+    return replace(
+        tool,
+        execute=execute,
+        input_model=governance.input_model,
+        timeout_seconds=30.0 if governance.access is AccessLevel.READ else 600.0,
+        max_attempts=2 if governance.access is AccessLevel.STAGE_WRITE else 1,
+        retry_delay_seconds=0.5,
+    )
+
+
 def build_novel_loop_tools(ctx: NovelToolContext) -> dict[str, AgentTool]:
-    """Assemble the model-facing tool set for the novel agent loop."""
-    tools = [
+    """Assemble the model-facing tool set, governed by ToolGateway."""
+    raw_tools = [
         _make_write_world(ctx),
         _make_write_cast(ctx),
+        _make_add_character(ctx),
         _make_write_outline(ctx),
         _make_write_chapter(ctx),
         _make_review_chapter(ctx),
         _make_mem_query(ctx),
+        _make_plan_query(ctx),
+        _make_read_chapter(ctx),
     ]
-    return {tool.name: tool for tool in tools}
+    registry = ToolRegistry()
+    for tool in raw_tools:
+        governance = _TOOL_GOVERNANCE[tool.name]
+
+        def handler(payload: LoopToolInput, _tool: AgentTool = tool) -> LoopToolOutput:
+            try:
+                return _as_output(_tool.execute(payload.args))
+            except ToolCancelledError:
+                raise
+            except Exception as error:  # domain failures are results, not gateway crashes
+                retryable = isinstance(error, ProviderTransportError) and error.kind in {
+                    ProviderFailureKind.TRANSIENT,
+                    ProviderFailureKind.TIMEOUT,
+                }
+                return LoopToolOutput(
+                    ok=False,
+                    error=f"工具异常 {type(error).__name__}: {str(error)[:400]}",
+                    retryable=retryable,
+                )
+
+        registry.register(
+            ToolSpec(
+                tool_id=governance.tool_id,
+                version="1.0.0",
+                input_model=LoopToolInput,
+                output_model=LoopToolOutput,
+                allowed_roles=frozenset((governance.role,)),
+                allowed_skill_ids=frozenset(("loop@1.0.0",)),
+                allowed_run_states=frozenset((RunStatus.RUNNING,)),
+                access_level=governance.access,
+                timeout_seconds=30.0 if governance.access is AccessLevel.READ else 600.0,
+                retry_policy=RetryPolicy(max_attempts=1),
+                idempotent=False,
+                audit_calls=True,
+                approval_policy=governance.approval,
+                artifact_policy=(
+                    ArtifactPolicy.NONE
+                    if governance.access is AccessLevel.READ
+                    else ArtifactPolicy.STAGE_ONLY
+                ),
+            ),
+            handler,
+        )
+    connection = getattr(ctx.coordinator, "connection", None)
+    gateway = ToolGateway(registry, connection)
+    return {
+        tool.name: _governed_tool(tool, _TOOL_GOVERNANCE[tool.name], gateway, ctx)
+        for tool in raw_tools
+    }
 
 
 # -- helpers ------------------------------------------------------------------
@@ -570,6 +886,7 @@ def _story_brief_from_ctx(ctx: NovelToolContext) -> StoryBrief:
         user_requirements=requirements,
         genre="fiction",
         target_chapter_count=ctx.brief.target_chapter_count or 10,
+        target_words=getattr(ctx.brief, "target_words", None),
         created_at=ctx.now(),
         provenance=ctx.brief.provenance,
     )
@@ -621,4 +938,178 @@ def _cast_adaptation(ctx: NovelToolContext, characters):
     )
 
 
-__all__ = ("NovelToolContext", "build_novel_loop_tools")
+_READ_ONLY_LOOP_TOOLS: frozenset[str] = frozenset(
+    ("mem_query", "plan_query", "review_chapter", "read_chapter")
+)
+
+
+def filter_tools_by_intent(
+    tools: dict[str, AgentTool],
+    intent: str | None,
+    *,
+    intents: tuple[str, ...] | None = None,
+    existing_assets: dict[str, object] | None = None,
+) -> dict[str, AgentTool]:
+    """Expose only the write tools the requested intents permit.
+
+    Read-only inspection tools stay available so the model can orient itself.
+    Composite intents are unioned in canonical stage order; sub-intents may
+    create prerequisites (world, and cast for an outline) when missing, but
+    never drift into a later stage.
+    """
+    requested = tuple(
+        dict.fromkeys(([intent] if intent else []) + list(intents or ()))
+    )
+    requested = tuple(item for item in requested if item != "unrecognized") or requested
+    if not requested:
+        return tools
+        return tools
+    if "full_novel" in requested:
+        return tools
+    capabilities = set(intent_capabilities(requested))
+    assets = existing_assets or {}
+    has_world = bool(assets.get("world_text") or assets.get("world_title"))
+    has_cast = bool(assets.get("characters"))
+    allowed: set[str] = set(_READ_ONLY_LOOP_TOOLS)
+    if "world" in capabilities and not has_world:
+        allowed.add("write_world")
+    if "cast" in capabilities and (
+        not has_cast or any(item in ("characters_only", "add_character") for item in requested)
+    ):
+        allowed.add("write_cast")
+    if "outline" in capabilities:
+        allowed.add("write_outline")
+    if "chapters" in capabilities:
+        allowed.add("write_chapter")
+    if "add_character" in capabilities:
+        allowed.add("add_character")
+    return {name: tool for name, tool in tools.items() if name in allowed}
+
+
+def _make_add_character(ctx: NovelToolContext) -> AgentTool:
+    def execute(args: dict) -> ToolResult:
+        name = args.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return ToolResult(ok=False, error="name 必须是非空字符串。")
+        name = name.strip()
+        existing = ctx._cast()
+        if existing is not None and any(card.name == name for card in existing.characters):
+            return ToolResult(
+                ok=False,
+                error=f"角色「{name}」已存在；如需重做请调用 write_cast 并传 target_names。",
+            )
+        # The cast-revision path keeps all non-target characters and generates
+        # the requested card, which is exactly the "append one character" case.
+        return _make_write_cast(ctx).execute({"target_names": [name]})
+
+    return AgentTool(
+        name="add_character",
+        description="为已有故事新增一个角色（传 name）；保留原有角色，不重生成整份 cast。",
+        input_schema={
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "新角色名"}},
+            "required": ["name"],
+        },
+        execute=execute,
+        requires_approval=True,
+    )
+
+
+def _accepted_chapter_row(ctx: NovelToolContext, chapter_plan_id: str):
+    """Find the accepted chapter artifact for a chapter plan.
+
+    Chapter staging derives the artifact id deterministically from
+    run_id + chapter_plan_id; older projects may still store the chapter
+    plan id directly, so that remains a fallback.
+    """
+    connection = ctx.coordinator.connection
+    seed = f"{ctx.lease.run_id}:{chapter_plan_id}"
+    artifact_id = "chapter-" + hashlib.sha256(seed.encode()).hexdigest()[:24]
+    row = connection.execute(
+        "SELECT artifact_id, raw_bytes FROM artifacts WHERE artifact_id = ? "
+        "AND kind = 'chapter' AND status = 'accepted' ORDER BY revision DESC LIMIT 1",
+        (artifact_id,),
+    ).fetchone()
+    if row is not None:
+        return row
+    return connection.execute(
+        "SELECT artifact_id, raw_bytes FROM artifacts WHERE artifact_id = ? "
+        "AND kind = 'chapter' AND status = 'accepted' ORDER BY revision DESC LIMIT 1",
+        (chapter_plan_id,),
+    ).fetchone()
+
+
+def _accepted_chapter_artifact_id(ctx: NovelToolContext, chapter_plan_id: str) -> str | None:
+    row = _accepted_chapter_row(ctx, chapter_plan_id)
+    return str(row[0]) if row is not None else None
+
+
+def _make_plan_query(ctx: NovelToolContext) -> AgentTool:
+    def execute(args: dict) -> ToolResult:
+        plan, revision = _resolve_plan(ctx)
+        if plan is None:
+            return ToolResult(ok=False, error="当前没有可用大纲。")
+        lines = [
+            f"第{chapter.chapter_number}章《{chapter.title}》：{chapter.goal}"
+            for chapter in sorted(plan.chapters, key=lambda item: item.chapter_number)
+        ]
+        return ToolResult(
+            ok=True,
+            summary=f"当前大纲（revision {revision}，共{len(plan.chapters)}章）：\n" + "\n".join(lines),
+            artifact_ref=plan.plan_id,
+        )
+
+    return AgentTool(
+        name="plan_query",
+        description="查看当前大纲的章节编号、标题与目标，写章节前用来确认章节号。",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": True},
+        execute=execute,
+        supports_parallel=True,
+    )
+
+
+def _make_read_chapter(ctx: NovelToolContext) -> AgentTool:
+    def execute(args: dict) -> ToolResult:
+        chapter_number = args.get("chapter_number")
+        if not isinstance(chapter_number, int) or chapter_number < 1:
+            return ToolResult(ok=False, error="chapter_number 必须是正整数。")
+        plan, _revision = _resolve_plan(ctx)
+        if plan is None:
+            return ToolResult(ok=False, error="当前没有可用大纲。")
+        chapter = next((item for item in plan.chapters if item.chapter_number == chapter_number), None)
+        if chapter is None:
+            return ToolResult(ok=False, error=f"大纲中没有第 {chapter_number} 章。")
+        row = _accepted_chapter_row(ctx, chapter.chapter_plan_id)
+        if row is None:
+            return ToolResult(ok=False, error=f"第 {chapter_number} 章尚未有已接受的正文。")
+        text = bytes(row[1]).decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            for key in ("passage", "text", "content", "summary"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    text = value
+                    break
+        return ToolResult(
+            ok=True,
+            summary=f"第 {chapter_number} 章正文（节选）：\n{text[:3000]}",
+            artifact_ref=str(row[0]),
+        )
+
+    return AgentTool(
+        name="read_chapter",
+        description="读取已接受章节的正文节选（按章节号），用于续写或检查连续性。",
+        input_schema={
+            "type": "object",
+            "properties": {"chapter_number": {"type": "integer", "minimum": 1}},
+            "required": ["chapter_number"],
+        },
+        execute=execute,
+        supports_parallel=True,
+    )
+
+
+__all__ = ("NovelToolContext", "build_novel_loop_tools", "filter_tools_by_intent")

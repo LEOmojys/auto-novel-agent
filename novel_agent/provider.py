@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 from dataclasses import dataclass
 from typing import assert_never
 
 from novel_agent.contracts import ProviderOutcome, ProviderRequest, ProviderResponse, Provenance, ProvenanceKind
+from novel_agent.tool_runtime import combine_tokens, current_tool_token
 from novel_agent.provider_types import (
     CancellationToken,
     LegacyDeepSeekTransport,
@@ -21,12 +23,28 @@ from novel_agent.provider_types import (
 )
 
 
+def _generate_with_cancellation(transport: ProviderTransport, request: ProviderRequest, cancellation: object) -> ProviderTransportResult:
+    try:
+        parameters = inspect.signature(transport.generate).parameters
+    except (TypeError, ValueError):
+        return transport.generate(request)
+    if "cancellation" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        return transport.generate(request, cancellation=cancellation)
+    return transport.generate(request)
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderClient:
     dependencies: ProviderDependencies
     policy: ProviderPolicy = ProviderPolicy()
 
     def generate(self, request: ProviderRequest, cancellation: CancellationToken) -> ProviderGenerationResult:
+        # The tool scope may carry a run cancellation token and a deadline; the
+        # provider transport checks it between stream chunks.
+        cancellation = combine_tokens(cancellation, current_tool_token())
         attempts: list[ProviderAttempt] = []
         started_at = self.dependencies.monotonic()
         if cancellation.is_cancelled():
@@ -38,7 +56,9 @@ class ProviderClient:
             if self._deadline_expired(started_at):
                 return self._failed(request, tuple(attempts), ProviderFailureKind.TIMEOUT)
             try:
-                payload = self.dependencies.transport.generate(request)
+                payload = _generate_with_cancellation(
+                    self.dependencies.transport, request, cancellation
+                )
             except ProviderTransportError as failure:
                 attempts.append(
                     ProviderAttempt(

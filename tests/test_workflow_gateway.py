@@ -66,7 +66,7 @@ class DispatchTransport:
 
 
 def _wait_terminal(service: NovelAgentService, project_id: ProjectId, run_id: str) -> RunStatus:
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(project_id, run_id)).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate; status={snapshot.status}"

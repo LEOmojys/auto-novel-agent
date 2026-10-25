@@ -516,10 +516,14 @@ class GovernedCreativeAdapter:
         chapter = request.chapter_plan
         repair_instruction = ""
         if request.repair_brief is not None:
+            details = "\n".join(
+                f"- {item}" for item in request.repair_brief.failure_details
+            )
             repair_instruction = (
                 f"## 上次修订反馈（第 {request.repair_brief.repair_attempt} 次）\n"
                 f"失败原因：{', '.join(request.repair_brief.failure_codes)}\n"
-                "请针对上述问题重写本章，不要重复之前的写法。\n\n"
+                + (f"具体反馈：\n{details}\n" if details else "")
+                + "请针对上述问题重写本章，不要重复之前的写法。\n\n"
             )
         prompt = self._prompt("chapter-scene").format(
             chapter_number=chapter.chapter_number,

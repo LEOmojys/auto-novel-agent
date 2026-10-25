@@ -245,6 +245,7 @@ class RunCoordinator(RevisionCoordinatorMixin, ChapterCoordinatorMixin, Planning
             "provider_failures",
             "memory_conflicts",
             "tool_calls",
+            "loop_operations",
             "provider_calls",
             "task_results",
             "tasks",
@@ -440,6 +441,42 @@ class RunCoordinator(RevisionCoordinatorMixin, ChapterCoordinatorMixin, Planning
                 return self._fail_run_on(connection, lease, reason)
             finally:
                 connection.close()
+
+    def finalize_cancelled(self, lease: RunLease, reason: str = "user_cancelled") -> bool:
+        """Finalize a CANCEL_REQUESTED run even if the stage exited early."""
+        try:
+            return self._finalize_cancelled_on(self._connection, lease, reason)
+        except TransactionStateError:
+            connection = self._write_connection()
+            if connection is None:
+                return False
+            try:
+                return self._finalize_cancelled_on(connection, lease, reason)
+            finally:
+                connection.close()
+
+    def _finalize_cancelled_on(
+        self, connection: sqlite3.Connection, lease: RunLease, reason: str
+    ) -> bool:
+        with write_transaction(connection):
+            row = connection.execute(
+                "SELECT state FROM runs WHERE run_id = ?", (lease.run_id,)
+            ).fetchone()
+            if row is None or str(row[0]) not in (
+                RunStatus.RUNNING.value,
+                RunStatus.CANCEL_REQUESTED.value,
+            ):
+                return False
+            now = self._now()
+            connection.execute(
+                "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
+                (RunStatus.CANCELLED.value, now.isoformat(), lease.run_id),
+            )
+            append_run_event(
+                connection,
+                RunEvent(lease.run_id, "run_cancelled", {"reason": reason}, now),
+            )
+            return True
 
     def _fail_run_on(self, connection: sqlite3.Connection, lease: RunLease, reason: str) -> bool:
         with write_transaction(connection):

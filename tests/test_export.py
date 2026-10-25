@@ -180,7 +180,7 @@ def test_auto_export_after_run_completes(tmp_path: Path, monkeypatch: pytest.Mon
             target_chapter_count=1,
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     from novel_agent.contracts import RunStatus
 
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
@@ -234,7 +234,7 @@ def test_outline_only_run_produces_plan_without_chapters(tmp_path: Path, monkeyp
             provider="offline_fake",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "outline-only")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"

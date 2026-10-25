@@ -6,6 +6,7 @@ from novel_agent.chapter_commit_models import ChapterCommitContext
 from novel_agent.chapter_errors import ChapterCommitBlocked, ChapterPersistenceError
 from novel_agent.chapter_models import ChapterAcceptanceReceipt, ChapterAcceptanceRequest
 from novel_agent.chapter_task_commit import complete_chapter_task
+from novel_agent.quality_gate import quality_accepted
 from novel_agent.memory_promotion import promote_candidates
 
 
@@ -15,6 +16,7 @@ def commit_chapter_acceptance(
 ) -> ChapterAcceptanceReceipt:
     connection = context.connection
     staged = request.staged
+    _require_quality_accept(connection, staged.artifact_id.root, staged.revision)
     updated = connection.execute(
         "UPDATE artifacts SET status = 'accepted', is_current = ? WHERE artifact_id = ? AND revision = ? "
         "AND project_id = ? AND run_id = ? AND status = 'staged' AND sha256 = ?",
@@ -47,6 +49,16 @@ def commit_chapter_acceptance(
     next_task_id = complete_chapter_task(context, request, staged.raw_sha256)
     insert_chapter_audit_manifest(context, request, staged.raw_sha256)
     return ChapterAcceptanceReceipt(staged.artifact_id, staged.revision, next_task_id, promoted)
+
+
+def _require_quality_accept(
+    connection,
+    artifact_id: str,
+    revision: int,
+) -> None:
+    """The quality gate is authoritative: no ACCEPT report, no commit."""
+    if not quality_accepted(connection, artifact_id, revision):
+        raise ChapterCommitBlocked("quality_not_accepted")
 
 
 def _promote_candidates(

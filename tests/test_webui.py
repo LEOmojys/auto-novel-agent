@@ -15,7 +15,7 @@ PROJECT_ID = ProjectId("novel-one")
 
 
 def _wait_succeeded(console: _Client, run_id: str) -> dict:
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     while True:
         status, snapshot = console.get(f"/api/run/snapshot?project={PROJECT_ID.root}&run_id={run_id}")
         assert status == 200

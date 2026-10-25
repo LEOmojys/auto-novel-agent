@@ -12,6 +12,7 @@ from novel_agent.tool_call_ledger import (
     ToolCallLedgerWrite,
     ToolCallReservation,
     complete_tool_call,
+    persist_tool_call,
     reserve_tool_call,
 )
 
@@ -69,8 +70,27 @@ def reserve_result(
     request: ToolInvocationRequest,
     spec: ToolSpec,
     input_hash: str,
+    *,
+    max_attempts: int = 1,
+    retry_after_seconds: float = 30.0,
 ) -> ToolCallReservation:
-    return reserve_tool_call(connection, _ledger_write(request, spec, None, input_hash))
+    return reserve_tool_call(
+        connection,
+        _ledger_write(request, spec, None, input_hash),
+        max_attempts=max_attempts,
+        retry_after_seconds=retry_after_seconds,
+    )
+
+
+def record_result(
+    connection: sqlite3.Connection,
+    request: ToolInvocationRequest,
+    spec: ToolSpec,
+    result: ToolCallResult,
+    input_hash: str,
+) -> None:
+    """Insert a completed audit row for a non-idempotent tool call."""
+    persist_tool_call(connection, _ledger_write(request, spec, result, input_hash))
 
 
 def _ledger_write(

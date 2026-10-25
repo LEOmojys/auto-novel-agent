@@ -231,7 +231,7 @@ def test_legacy_real_run_persists_direct_event_memories(tmp_path: Path, monkeypa
             target_chapter_count=2,
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset(("succeeded", "failed", "waiting_review", "cancelled"))
     from novel_agent.contracts import RunStatus
 

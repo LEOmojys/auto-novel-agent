@@ -60,6 +60,8 @@ class RetryPolicy(BaseModel):
 
     max_attempts: int = Field(ge=1, le=5)
     retryable_error_codes: frozenset[str] = frozenset()
+    #: Seconds a terminal failure is cached before the same key may retry.
+    retry_after_seconds: float = Field(default=30.0, ge=0.0, le=3_600.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +86,9 @@ class ToolSpec(BaseModel):
     timeout_seconds: float = Field(gt=0.0, le=600.0)
     retry_policy: RetryPolicy
     idempotent: bool
+    #: Persist every completed call to the tool_calls ledger even when the
+    #: tool is not idempotent (used by model-facing loop tools).
+    audit_calls: bool = False
     approval_policy: ApprovalPolicy
     artifact_policy: ArtifactPolicy
 

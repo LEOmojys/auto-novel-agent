@@ -22,6 +22,7 @@ class StoryBrief(ContractModel):
     user_requirements: str
     genre: str
     target_chapter_count: int
+    target_words: int | None = None
     created_at: datetime
     provenance: Provenance
 

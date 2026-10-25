@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from threading import Event, Lock, Thread
 from time import monotonic
 from typing import Protocol
@@ -77,8 +78,10 @@ class RunWorker:
             # Poll for a user CANCEL while the stage runs, so the cancellation
             # token reaches the stage promptly instead of only at timeout.
             deadline = monotonic() + self._stage_timeout_seconds
+            user_cancelled = False
             while stage_thread.is_alive():
                 if self._coordinator.is_cancel_requested(lease.run_id):
+                    user_cancelled = True
                     cancellation.cancel()
                     break
                 remaining = deadline - monotonic()
@@ -103,10 +106,23 @@ class RunWorker:
                 stage_thread.join(self._cancellation_grace_seconds)
             if stage_thread.is_alive():
                 release_lock = False
-                self._quarantine_until_finished(stage_thread)
+                self._quarantine_until_finished(
+                    stage_thread,
+                    on_finished=lambda: self._coordinator.finalize_cancelled(
+                        lease, "user_cancelled_after_grace"
+                    )
+                    if user_cancelled
+                    else None,
+                )
                 return None
+            if user_cancelled:
+                self._coordinator.finalize_cancelled(lease, "user_cancelled")
+                return recovery
             if errors:
-                self._coordinator.fail_run(lease, type(errors[0]).__name__)
+                # Keep the exception class and a bounded message so failures are
+                # diagnosable from run_events (previously only the class name).
+                reason = f"{type(errors[0]).__name__}: {str(errors[0])[:160]}"
+                self._coordinator.fail_run(lease, reason)
                 return None
             return recovery
         finally:
@@ -131,12 +147,21 @@ class RunWorker:
         else:
             execute(recovery)
 
-    def _quarantine_until_finished(self, stage_thread: Thread) -> None:
+    def _quarantine_until_finished(
+        self,
+        stage_thread: Thread,
+        on_finished: Callable[[], None] | None = None,
+    ) -> None:
         with self._quarantine_guard:
             self._quarantined_scopes.add(self._scope_key)
 
         def clear() -> None:
             stage_thread.join()
+            if on_finished is not None:
+                try:
+                    on_finished()
+                except Exception:  # noqa: BROAD_EXCEPT_OK - quarantine cleanup is best effort
+                    pass
             with self._quarantine_guard:
                 self._quarantined_scopes.discard(self._scope_key)
             self._lock.release()

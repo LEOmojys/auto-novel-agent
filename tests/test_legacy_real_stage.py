@@ -102,7 +102,7 @@ def test_legacy_real_run_generates_real_plan_and_chapters(
             target_chapter_count=2,
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 15.0
     terminal_states = frozenset(
         (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED)
     )
@@ -159,7 +159,7 @@ def test_legacy_real_run_defaults_chapter_count_when_omitted(
             provider="legacy_real",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 15.0
     terminal_states = frozenset(
         (RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED)
     )

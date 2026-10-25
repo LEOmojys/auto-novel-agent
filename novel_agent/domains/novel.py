@@ -25,7 +25,7 @@ from novel_agent.adapters import (
     SchemaFailure,
     WorldAdaptation,
 )
-from novel_agent.agent.brief import BriefContract
+from novel_agent.agent.brief import BriefContract, intent_capabilities
 from novel_agent.agent.domain_plugin import (
     NodeExecutionContext,
     NodeExecutionResult,
@@ -118,13 +118,21 @@ class NovelDomainPlugin:
         if plan is not None:
             graph = self._graph_from_plan(plan, brief, run_id=run_id, project_id=project_id, now=now)
         else:
-            intent = brief.intent
-            if intent == "world_only":
-                graph = self._world_only_graph(brief, run_id=run_id, project_id=project_id, now=now)
-            elif intent == "characters_only":
-                graph = self._characters_only_graph(brief, run_id=run_id, project_id=project_id, now=now)
-            elif intent == "outline_only":
+            requested = tuple(
+                dict.fromkeys(
+                    ([brief.intent] if brief.intent != "unrecognized" else [])
+                    + list(brief.intents or ())
+                )
+            ) or (brief.intent,)
+            capabilities = set(intent_capabilities(requested))
+            if "full_novel" in requested or "chapters" in capabilities:
+                graph = self._full_novel_graph(brief, run_id=run_id, project_id=project_id, now=now)
+            elif "outline" in capabilities:
                 graph = self._outline_only_graph(brief, run_id=run_id, project_id=project_id, now=now)
+            elif "cast" in capabilities or "add_character" in capabilities:
+                graph = self._characters_only_graph(brief, run_id=run_id, project_id=project_id, now=now)
+            elif "world" in capabilities:
+                graph = self._world_only_graph(brief, run_id=run_id, project_id=project_id, now=now)
             else:
                 graph = self._full_novel_graph(brief, run_id=run_id, project_id=project_id, now=now)
         if self.plan_info_holder is not None:
@@ -1180,7 +1188,7 @@ class _NovelNodeExecutor(NodeExecutor):
             project_id=context.project_id,
             plan=plan,
             plan_revision=plan_revision,
-            target_chinese_characters=_DEFAULT_TARGET_WORDS,
+            target_chinese_characters=getattr(brief, "target_words", None) or _DEFAULT_TARGET_WORDS,
             genre=brief.genre,
             activate=not force_rewrite,
             auto_approve=self._plugin.auto_approve,
@@ -1454,6 +1462,7 @@ def _story_brief(context: NodeExecutionContext) -> StoryBrief:
         user_requirements=context.brief.raw_requirements,
         genre="fiction",
         target_chapter_count=context.brief.target_chapter_count or 10,
+        target_words=getattr(context.brief, "target_words", None),
         created_at=context.now(),
         provenance=context.brief.provenance,
     )

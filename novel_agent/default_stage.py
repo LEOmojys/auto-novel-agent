@@ -332,6 +332,28 @@ def _request_plan_approval(
     )
 
 
+def _pause_for_intent_clarification(
+    coordinator: RunCoordinator,
+    run_id: str,
+    lease: object,
+    brief: object,
+    now: Callable[[], datetime],
+) -> None:
+    conflicts = tuple(getattr(brief, "intent_conflicts", ()) or ())
+    question = getattr(brief, "clarification_question", None)
+    append_run_event(
+        coordinator.connection,
+        RunEvent(
+            run_id,
+            "clarification_required",
+            {"conflicts": ",".join(conflicts), "question": question or ""},
+            now(),
+        ),
+    )
+    coordinator.block_planning(lease, "intent_clarification_required")
+
+
+
 def _finish_run_if_pending(
     coordinator: RunCoordinator,
     run_id: str,
@@ -501,6 +523,7 @@ def _execute_graph_stage(
                 "goal": brief.goal,
                 "domain": brief.domain,
                 "intent": brief.intent,
+                "intents": ",".join(tuple(brief.intents or (brief.intent,))),
                 "degraded": brief.degraded,
                 "degraded_reason": brief.degraded_reason or "",
                 "degraded_detail": brief.degraded_detail or "",
@@ -534,6 +557,10 @@ def _execute_graph_stage(
         )
         coordinator.fail_run(recovery.lease, "intent_recognition_failed")
         return
+    if getattr(brief, "needs_clarification", False):
+        _pause_for_intent_clarification(coordinator, request.run_id, recovery.lease, brief, now)
+        return
+
     from novel_agent.domains.novel import detect_existing_assets, existing_assets_summary
 
     existing_assets = detect_existing_assets(
@@ -731,6 +758,9 @@ class _LegacyStage:
                 run_id=self.request.run_id,
                 prompt=templates.get("plan-execution"),
                 existing_summary=existing_assets_summary(existing_assets),
+                existing_world=bool(existing_assets.get("world_text") or existing_assets.get("world_title")),
+                existing_cast=bool(existing_assets.get("characters")),
+                existing_outline=bool(existing_assets.get("outline")),
                 failure_holder=plan_info_holder,
                 failure_sink=failure_sink,
                 call_event_sink=call_event_sink,
@@ -801,7 +831,7 @@ class _AgentLoopStage:
         from novel_agent.agent_loop import AgentLoop, LoopConfig
         from novel_agent.domains.novel import NovelDomainPlugin
         from novel_agent.loop_state import LoopState, load_loop_state, save_loop_state
-        from novel_agent.novel_tools import NovelToolContext, build_novel_loop_tools
+        from novel_agent.novel_tools import NovelToolContext, build_novel_loop_tools, filter_tools_by_intent
 
         decision_transport = self.loop_transport or self.transport or LegacyDeepSeekTransport(call=_call_deepseek)
         catalog = load_builtin_catalog()
@@ -815,6 +845,7 @@ class _AgentLoopStage:
         # deterministic offline generators so tests can script the decision
         # transport without routing ambiguity; production uses the governed
         # (live-model) adapter for both.
+        summarizer: Callable[[list, str], str | None] | None = None
         if self.offline_generators:
             timestamp = self.now()
             generator: object = OfflinePlanningGenerator(timestamp)
@@ -855,6 +886,22 @@ class _AgentLoopStage:
                     call_event_sink=call_event_sink,
                 )
             }
+            if os.environ.get("NOVEL_AGENT_LLM_SUMMARY", "llm").strip().lower() not in {
+                "off",
+                "deterministic",
+                "none",
+            }:
+                from novel_agent.context_summarizer import ProviderContextSummarizer
+
+                summarizer = ProviderContextSummarizer(
+                    transport=self.transport or decision_transport,
+                    now=self.now,
+                    run_id=self.request.run_id,
+                    model_name=os.environ.get("NOVEL_AGENT_SUMMARY_MODEL", "deepseek-v4-flash"),
+                    prompt=templates.get("context-summary"),
+                    failure_sink=failure_sink,
+                    call_event_sink=call_event_sink,
+                ).summarize
         gateway = _build_tool_gateway(
             self.coordinator,
             planning_generator=generator,
@@ -888,6 +935,7 @@ class _AgentLoopStage:
                     "goal": brief.goal,
                     "domain": brief.domain,
                     "intent": brief.intent,
+                "intents": ",".join(tuple(brief.intents or (brief.intent,))),
                     "degraded": brief.degraded,
                     "degraded_reason": brief.degraded_reason or "",
                     "constraints": ",".join(brief.constraints),
@@ -902,6 +950,12 @@ class _AgentLoopStage:
         if brief.intent == _INTENT_UNRECOGNIZED and not brief.degraded:
             self.coordinator.fail_run(recovery.lease, "intent_recognition_failed")
             return
+        if getattr(brief, "needs_clarification", False):
+            _pause_for_intent_clarification(
+                self.coordinator, self.request.run_id, recovery.lease, brief, self.now
+            )
+            return
+
 
         # 1b) Existing assets for reuse.  A "new story" request (brief.fresh)
         # must NOT reuse the project's old world/cast/outline — start clean.
@@ -940,13 +994,35 @@ class _AgentLoopStage:
             gateway=gateway,
             path_resolver=self.path_resolver,
         )
-        tools = build_novel_loop_tools(ctx)
+        tools = filter_tools_by_intent(
+            build_novel_loop_tools(ctx),
+            getattr(brief, "intent", None),
+            intents=tuple(getattr(brief, "intents", ()) or ()),
+            existing_assets=existing_assets,
+        )
 
         # 4) Run the loop.  Events are streamed to run_events for the console.
         def event_sink(event_type: str, payload: dict[str, object]) -> None:
             append_run_event(
                 self.coordinator.connection,
                 RunEvent(self.request.run_id, event_type, payload, self.now()),
+            )
+
+        def checkpoint(step: int, plan: tuple[tuple[str, dict], ...], plan_index: int, summary: str) -> None:
+            save_loop_state(
+                self.coordinator.connection,
+                LoopState(
+                    run_id=self.request.run_id,
+                    step=step,
+                    plan_ref=ctx.plan_ref,
+                    summary=summary,
+                    remaining_plan=tuple(plan[plan_index:]),
+                    plan_index=0,
+                    written_chapters=tuple(
+                        sorted(int(n) for n in ((existing_assets or {}).get("written_chapters") or ()))
+                    ),
+                ),
+                self.now(),
             )
 
         loop = AgentLoop(
@@ -959,6 +1035,11 @@ class _AgentLoopStage:
                 "agent_loop", "deepseek-v4-pro", "provider_failure", reason, ""
             ),
             cancellation=cancellation,
+            summarizer=summarizer,
+            existing_world=bool(existing_assets.get("world_text") or existing_assets.get("world_title")),
+            existing_cast=bool(existing_assets.get("characters")),
+            existing_outline=bool(existing_assets.get("outline")),
+            checkpoint=checkpoint,
         )
         # Resume a previously-paused loop (approval/repair) by replaying the
         # persisted tool-call trace so the model keeps its context.
@@ -966,6 +1047,7 @@ class _AgentLoopStage:
         loop_prompt = _LOOP_SYSTEM_PROMPT.format(
             tools=", ".join(tools),
             intent=str(brief.intent or ""),
+            intents=" / ".join(tuple(brief.intents or (brief.intent,))),
             constraints="；".join(brief.constraints or ()) or "（无）",
             acceptance="；".join(brief.acceptance_criteria or ()) or "（无）",
             style="；".join(brief.style_guidance or ()) or "（无）",
@@ -981,6 +1063,7 @@ class _AgentLoopStage:
             task=self.request.user_requirements,
             memory_snapshot=existing_assets_summary(existing_assets),
             initial_history=initial_history,
+            initial_summary=prior.summary if prior is not None else "",
             initial_plan=prior.remaining_plan if prior is not None else (),
             initial_plan_index=prior.plan_index if prior is not None else 0,
         )
@@ -988,8 +1071,9 @@ class _AgentLoopStage:
         # 5) Persist the final loop state and finish.
         state = LoopState(
             run_id=self.request.run_id,
-            step=len(history),
+            step=loop.steps_taken,
             plan_ref=ctx.plan_ref,
+            summary=loop.rolling_summary,
             written_chapters=tuple(
                 sorted(int(n) for n in ((existing_assets or {}).get("written_chapters") or ()))
             ),
@@ -997,6 +1081,7 @@ class _AgentLoopStage:
         save_loop_state(self.coordinator.connection, state, self.now())
 
         if cancellation is not None and cancellation.is_cancelled():
+            self.coordinator.finalize_cancelled(recovery.lease, "user_cancelled")
             return
         if outcome == "waiting_approval":
             # An approval-gated tool staged its output; the run is already
@@ -1010,8 +1095,9 @@ class _AgentLoopStage:
                     self.coordinator.connection,
                     LoopState(
                         run_id=self.request.run_id,
-                        step=len(history),
+                        step=loop.steps_taken,
                         plan_ref=ctx.plan_ref,
+                        summary=loop.rolling_summary,
                         pending_action={"tool": pending_tool, "args": pending or {}},
                         written_chapters=state.written_chapters,
                         remaining_plan=remaining,
@@ -1034,8 +1120,13 @@ class _AgentLoopStage:
             # run if nothing left it in a terminal state.
             _finish_run_if_pending(self.coordinator, self.request.run_id, self.now)
             return
-        if outcome == "step_limit":
-            self.coordinator.fail_run(recovery.lease, "agent_loop_step_limit")
+        if outcome in {"step_limit", "tool_budget", "timeout"}:
+            reason = {
+                "step_limit": "agent_loop_step_limit",
+                "tool_budget": "agent_loop_tool_budget",
+                "timeout": "agent_loop_timeout",
+            }[outcome]
+            self.coordinator.fail_run(recovery.lease, reason)
             return
         if outcome == "cancelled":
             # The user cancelled while the loop was running; the run is already
@@ -1065,6 +1156,7 @@ _LOOP_SYSTEM_PROMPT = """你是小说创作 Agent，工作范式为 Plan-Act（�
 ## 意图分析（系统已完成）
 系统已对你的需求做过意图分析，以下是分析结果——你的规划必须严格基于它：
 - 意图（intent）：{intent}
+- 全部交付意图（intents）：{intents}
 - 约束（constraints）：{constraints}
 - 验收标准（acceptance）：{acceptance}
 - 风格要求（style）：{style}
@@ -1085,7 +1177,8 @@ _LOOP_SYSTEM_PROMPT = """你是小说创作 Agent，工作范式为 Plan-Act（�
 2. {asset_rule}
 3. write_chapter 需要 chapter_number；"续写下一章"从已写章节的下一章开始。
 4. 严格使用可用工具名，不要编造工具。
-5. 首轮必须先输出 plan；计划执行完后按验收标准确认任务是否完成，完成则输出 {{"done": true}}。"""
+5. 严格遵守意图边界：world_only 只产出世界观；characters_only 只产出角色（必要时可先建世界）；outline_only 只到大纲；add_character 只修改角色；除 full_novel 外不得写章节，工具列表之外的工具不可用。
+6. 首轮必须先输出 plan；计划执行完后按验收标准确认任务是否完成，完成则输出 {{"done": true}}。"""
 
 
 def _story_brief_for_loop(brief: BriefContract):
@@ -1097,6 +1190,7 @@ def _story_brief_for_loop(brief: BriefContract):
         user_requirements=brief.raw_requirements,
         genre="fiction",
         target_chapter_count=brief.target_chapter_count or 10,
+        target_words=getattr(brief, "target_words", None),
         created_at=brief.created_at,
         provenance=brief.provenance,
     )

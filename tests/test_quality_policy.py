@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 
 from novel_agent.pathing import ProjectId
+from novel_agent.quality_gate import quality_accepted
 from novel_agent.quality import (
     CharacterFixture,
     ChapterMetrics,
@@ -94,7 +96,7 @@ def test_thresholds_accept_valid_chapter() -> None:
     # When: the project-scoped adapter reviews it.
     decision = _adapter().review(request, QualityPolicy())
     # Then: the chapter is accepted with its real evaluator mean.
-    assert (decision.outcome, decision.score, decision.policy_version) == (QualityOutcome.ACCEPT, 4.0, "1.0.0")
+    assert (decision.outcome, decision.score, decision.policy_version) == (QualityOutcome.ACCEPT, 4.0, "1.1.0")
 
 
 def test_length_and_locatable_beat_gaps_are_repairable() -> None:
@@ -174,3 +176,69 @@ def test_project_adapters_keep_character_fixtures_isolated() -> None:
     # Then: metrics and evaluator dependencies observe only their owning fixture.
     assert (decision_a.metrics.mentioned_character_ids, decision_b.metrics.mentioned_character_ids) == (("a",), ("b",))
     assert (seen_a[0].characters[0].name, seen_b[0].characters[0].name) == ("甲", "乙")
+
+
+def test_beat_match_tolerates_paraphrase() -> None:
+    request = _request(
+        required_beats=("抵达学院",),
+        located_beats=("林晚抵达了魔法学院门口",),
+    )
+    decision = _adapter().review(request, QualityPolicy())
+    assert decision.outcome is QualityOutcome.ACCEPT
+
+
+def test_missing_character_coverage_repairs() -> None:
+    request = _request(body="中" * 100)
+    characters = (CharacterFixture(character_id="c-1", name="林晚"),)
+    decision = _adapter(characters=characters).review(
+        request, QualityPolicy(minimum_mentioned_characters=1)
+    )
+    assert decision.outcome is QualityOutcome.REPAIR
+    assert "missing_character_coverage" in decision.reason_codes
+    assert any("missing_character_coverage" in item for item in decision.feedback)
+
+
+def test_quality_context_is_passed_to_evaluator() -> None:
+    seen: list[EvaluatorAdapterRequest] = []
+    evaluator = RecordingEvaluator(seen=seen)
+    request = _request(
+        style_guidance=("冷峻克制",),
+        world_rules=("魔法不可复活死者",),
+        acceptance_criteria=("主角必须出场",),
+        previous_summary="上一章主角抵达学院。",
+    )
+    decision = _adapter(evaluator).review(request, QualityPolicy())
+    assert decision.outcome is QualityOutcome.ACCEPT
+    assert seen
+    assert seen[0].style_guidance == ("冷峻克制",)
+    assert seen[0].world_rules == ("魔法不可复活死者",)
+    assert seen[0].acceptance_criteria == ("主角必须出场",)
+    assert seen[0].previous_summary == "上一章主角抵达学院。"
+
+
+def test_low_dimension_feedback_is_actionable() -> None:
+    response = VALID_SCORES.replace('"score":4', '"score":2', 1)
+    decision = _adapter(RecordingEvaluator(response=response)).review(_request(), QualityPolicy())
+    assert decision.outcome is QualityOutcome.REPAIR
+    assert decision.feedback
+    assert any("style_consistency" in item for item in decision.feedback)
+
+
+def test_quality_gate_uses_latest_report() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE quality_reports(artifact_id TEXT, artifact_revision INTEGER, "
+        "decision TEXT, created_at TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO quality_reports VALUES ('chapter-1', 1, 'REPAIR', '2030-01-01')"
+    )
+    assert not quality_accepted(connection, "chapter-1", 1)
+    connection.execute(
+        "INSERT INTO quality_reports VALUES ('chapter-1', 1, 'ACCEPT', '2030-01-02')"
+    )
+    assert quality_accepted(connection, "chapter-1", 1)
+    connection.execute(
+        "INSERT INTO quality_reports VALUES ('chapter-1', 1, 'PAUSE', '2030-01-03')"
+    )
+    assert not quality_accepted(connection, "chapter-1", 1)

@@ -116,8 +116,12 @@ def test_loop_hits_step_limit() -> None:
 def test_loop_doom_detection_breaks_identical_repeats() -> None:
     called: list[str] = []
     events: list[tuple[str, dict]] = []
+    def failing(args: dict) -> ToolResult:
+        called.append("a")
+        return ToolResult(ok=False, error="boom")
+
     loop = AgentLoop(
-        tools={"a": _recorder_tool("a", called)},
+        tools={"a": AgentTool(name="a", description="a", input_schema={}, execute=failing)},
         transport=_SeqTransport(['{"plan": [{"tool": "a", "args": {"x": 1}}]}'] * 10),
         now=lambda: FIXED_TIME,
         config=LoopConfig(max_steps=20, doom_loop_threshold=3),
@@ -910,9 +914,13 @@ def test_agent_loop_cancel_mid_run_stops_stage(projects_root: Path) -> None:
         sleep(0.3)  # let the loop start and enter the slow write_world model call
         coordinator.control(ControlRunRequest(run_id="cancel-mid", command_type=RunCommandType.CANCEL, idempotency_key="cancel-1"))
         t.join(15.0)
+        deadline = monotonic() + 10.0
         state = connection.execute("SELECT state FROM runs WHERE run_id='cancel-mid'").fetchone()
+        while state is not None and state[0] == RunStatus.CANCEL_REQUESTED.value and monotonic() < deadline:
+            sleep(0.01)
+            state = connection.execute("SELECT state FROM runs WHERE run_id='cancel-mid'").fetchone()
         assert state is not None
-        assert state[0] in (RunStatus.CANCEL_REQUESTED.value, RunStatus.CANCELLED.value), f"state={state}"
+        assert state[0] == RunStatus.CANCELLED.value, f"state={state}"
     finally:
         database.__exit__(None, None, None)
 
@@ -1095,3 +1103,206 @@ def test_agent_loop_fresh_story_marks_brief_and_runs(projects_root: Path) -> Non
         assert json.loads(str(fresh[0])).get("fresh") is True
     finally:
         database.__exit__(None, None, None)
+
+
+def test_tool_budget_caps_plan_auto_execution() -> None:
+    called: list[dict] = []
+
+    def execute(args: dict) -> ToolResult:
+        called.append(args)
+        return ToolResult(ok=True, summary="ok")
+
+    plan = {"plan": [{"tool": "a", "args": {"x": i}} for i in range(5)]}
+    loop = AgentLoop(
+        tools={"a": AgentTool(name="a", description="a", input_schema={}, execute=execute)},
+        transport=_SeqTransport([json.dumps(plan), '{"done": true}']),
+        now=lambda: FIXED_TIME,
+        config=LoopConfig(max_steps=10, max_tool_calls=2, doom_loop_threshold=100),
+    )
+    outcome, _history = loop.run(system_prompt="sys", task="任务")
+
+    assert outcome == "done"
+    assert len(called) == 2
+
+
+def test_plan_step_cap_is_enforced() -> None:
+    called: list[dict] = []
+    events: list[tuple[str, dict]] = []
+
+    def execute(args: dict) -> ToolResult:
+        called.append(args)
+        return ToolResult(ok=True, summary="ok")
+
+    plan = {"plan": [{"tool": "a", "args": {"x": i}} for i in range(5)]}
+    loop = AgentLoop(
+        tools={"a": AgentTool(name="a", description="a", input_schema={}, execute=execute)},
+        transport=_SeqTransport([json.dumps(plan), '{"done": true}']),
+        now=lambda: FIXED_TIME,
+        config=LoopConfig(max_steps=10, max_plan_steps=2, doom_loop_threshold=100),
+        event_sink=lambda event_type, payload: events.append((event_type, payload)),
+    )
+    outcome, _history = loop.run(system_prompt="sys", task="任务")
+
+    assert outcome == "done"
+    assert len(called) == 2
+    assert any(event_type == "loop_plan_truncated" for event_type, _ in events)
+
+
+def test_repeated_successful_write_is_blocked() -> None:
+    called: list[dict] = []
+    events: list[tuple[str, dict]] = []
+
+    def execute(args: dict) -> ToolResult:
+        called.append(args)
+        return ToolResult(ok=True, summary="ok")
+
+    step = {"tool": "a", "args": {"x": 1}}
+    plan = {"plan": [step, step, step]}
+    loop = AgentLoop(
+        tools={"a": AgentTool(name="a", description="a", input_schema={}, execute=execute)},
+        transport=_SeqTransport([json.dumps(plan), '{"done": true}']),
+        now=lambda: FIXED_TIME,
+        config=LoopConfig(max_steps=10, max_tool_calls=20, doom_loop_threshold=100),
+        event_sink=lambda event_type, payload: events.append((event_type, payload)),
+    )
+    outcome, _history = loop.run(system_prompt="sys", task="任务")
+
+    assert outcome == "done"
+    assert len(called) == 2
+    assert any(event_type == "loop_repeat_detected" for event_type, _ in events)
+
+
+def test_intent_filters_write_tools() -> None:
+    from novel_agent.novel_tools import filter_tools_by_intent
+
+    tools = {
+        name: AgentTool(name=name, description=name, input_schema={}, execute=lambda args: ToolResult(ok=True))
+        for name in (
+            "write_world",
+            "write_cast",
+            "add_character",
+            "write_outline",
+            "write_chapter",
+            "mem_query",
+            "plan_query",
+            "review_chapter",
+            "read_chapter",
+        )
+    }
+    world_only = filter_tools_by_intent(tools, "world_only")
+    assert "write_world" in world_only
+    assert "write_chapter" not in world_only
+    assert "write_cast" not in world_only
+
+    characters_only = filter_tools_by_intent(tools, "characters_only")
+    assert {"write_world", "write_cast"} <= set(characters_only)
+    assert "write_outline" not in characters_only
+    assert "write_chapter" not in characters_only
+
+    outline_only = filter_tools_by_intent(
+        tools,
+        "outline_only",
+        existing_assets={"world_text": "w", "characters": [{"name": "a"}]},
+    )
+    assert "write_outline" in outline_only
+    assert "write_world" not in outline_only
+    assert "write_cast" not in outline_only
+    assert "write_chapter" not in outline_only
+
+    add_character = filter_tools_by_intent(tools, "add_character")
+    assert "add_character" in add_character
+    assert "write_cast" not in add_character
+    assert "write_world" not in add_character
+
+    composite = filter_tools_by_intent(
+        tools,
+        "characters_only",
+        intents=("characters_only", "outline_only"),
+    )
+    assert {"write_world", "write_cast", "write_outline"} <= set(composite)
+    assert "write_chapter" not in composite
+
+
+def test_filtered_plan_step_is_reported_to_model() -> None:
+    called: list[str] = []
+    events: list[tuple[str, dict]] = []
+
+    def execute(name: str):
+        def run(args: dict) -> ToolResult:
+            called.append(name)
+            return ToolResult(ok=True, summary="ok")
+
+        return run
+
+    transport = _SeqTransport([
+        json.dumps({"plan": [{"tool": "a", "args": {}}, {"tool": "b", "args": {}}]}),
+        '{"done": true}',
+    ])
+    loop = AgentLoop(
+        tools={"a": AgentTool(name="a", description="a", input_schema={}, execute=execute("a"))},
+        transport=transport,
+        now=lambda: FIXED_TIME,
+        config=LoopConfig(max_steps=6, doom_loop_threshold=100),
+        event_sink=lambda event_type, payload: events.append((event_type, payload)),
+    )
+    outcome, history = loop.run(system_prompt="sys", task="任务")
+
+    assert outcome == "done"
+    assert called == ["a"]
+    assert any(event_type == "loop_plan_filtered" for event_type, _ in events)
+    assert any("不在当前意图允许范围内" in message.content for message in history)
+
+
+def test_plan_sequence_rejects_wrong_order_and_duplicates() -> None:
+    from novel_agent.agent_loop import validate_plan_sequence
+
+    assert "write_cast_before_write_world" in validate_plan_sequence([
+        ("write_cast", {}), ("write_world", {})
+    ])
+    assert "write_chapter_before_write_outline" in validate_plan_sequence([
+        ("write_chapter", {"chapter_number": 1}), ("write_outline", {})
+    ])
+    assert "duplicate_chapter_number" in validate_plan_sequence([
+        ("write_chapter", {"chapter_number": 1}), ("write_chapter", {"chapter_number": 1})
+    ])
+    assert "chapter_numbers_out_of_order" in validate_plan_sequence([
+        ("write_chapter", {"chapter_number": 2}), ("write_chapter", {"chapter_number": 1})
+    ])
+    assert validate_plan_sequence([
+        ("write_world", {}),
+        ("write_cast", {}),
+        ("write_outline", {}),
+        ("write_chapter", {"chapter_number": 1}),
+        ("write_chapter", {"chapter_number": 2}),
+    ]) == ()
+
+
+def test_invalid_plan_order_is_rejected_before_execution() -> None:
+    called: list[str] = []
+    events: list[tuple[str, dict]] = []
+
+    def execute(args: dict) -> ToolResult:
+        called.append("cast")
+        return ToolResult(ok=True, summary="ok")
+
+    transport = _SeqTransport([
+        json.dumps({"plan": [{"tool": "write_cast", "args": {}}, {"tool": "write_world", "args": {}}]}),
+        '{"done": true}',
+    ])
+    loop = AgentLoop(
+        tools={
+            "write_cast": AgentTool(name="write_cast", description="c", input_schema={}, execute=execute),
+            "write_world": AgentTool(
+                name="write_world", description="w", input_schema={}, execute=lambda args: ToolResult(ok=True)
+            ),
+        },
+        transport=transport,
+        now=lambda: FIXED_TIME,
+        config=LoopConfig(max_steps=6, doom_loop_threshold=100),
+        event_sink=lambda event_type, payload: events.append((event_type, payload)),
+    )
+    outcome, _history = loop.run(system_prompt="sys", task="任务")
+
+    assert outcome == "done"
+    assert called == []
+    assert any(event_type == "loop_plan_rejected" for event_type, _ in events)

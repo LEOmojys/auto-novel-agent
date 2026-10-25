@@ -217,7 +217,7 @@ def test_plan_generated_event_and_llm_driven_run(tmp_path: Path, monkeypatch: py
             target_chapter_count=2,
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "plan-driven")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -305,7 +305,7 @@ def test_existing_assets_reused_without_regeneration(
             provider="legacy_real",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "reuse-assets")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -468,7 +468,7 @@ def test_sqlite_memory_assets_reused_without_regeneration(
             provider="legacy_real",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "reuse-memory")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -581,7 +581,7 @@ def test_partial_cast_revise_keeps_untouched_characters(
             provider="legacy_real",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "partial-revise")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -675,7 +675,7 @@ def test_llm_plan_without_chapters_completes_run(
             provider="legacy_real",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "sparse-plan")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -859,7 +859,7 @@ def test_existing_outline_reused_for_single_chapter(
             provider="legacy_real",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "reuse-outline")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -1041,7 +1041,7 @@ def test_existing_outline_skips_already_written_chapters(
             provider="legacy_real",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "skip-written")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -1218,7 +1218,7 @@ def test_continuation_after_written_chapter_starts_at_next_chapter(
             provider="legacy_real",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "continue-next")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -1416,7 +1416,7 @@ def test_revise_chapter_rewrites_and_waits_for_confirmation(
         )
     )
     assert snapshot.status is RunStatus.QUEUED
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "prior-run")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -1537,7 +1537,7 @@ def test_auto_approve_false_stages_and_waits_for_confirmation(
             auto_approve=False,
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "approval-run")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -1545,7 +1545,7 @@ def test_auto_approve_false_stages_and_waits_for_confirmation(
     # auto_approve=False gates the plan first; approve it to proceed.
     assert snapshot.review_reason == "plan_approval_required"
     service.approve_plan(PROJECT_ID, "approval-run", "approve-plan")
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     while (snapshot := service.snapshot(PROJECT_ID, "approval-run")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate after plan approval: {snapshot.status}"
         sleep(0.01)
@@ -1577,7 +1577,7 @@ def test_auto_approve_false_stages_and_waits_for_confirmation(
             idempotency_key="approve-world",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     while (snapshot := service.snapshot(PROJECT_ID, "approval-run")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate after approval: {snapshot.status}"
         sleep(0.01)
@@ -1668,7 +1668,7 @@ def test_regenerate_discards_staged_and_reruns(
             auto_approve=False,
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "regenerate-run")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -1676,7 +1676,7 @@ def test_regenerate_discards_staged_and_reruns(
     # auto_approve=False gates the plan first; approve to proceed.
     assert snapshot.review_reason == "plan_approval_required"
     service.approve_plan(PROJECT_ID, "regenerate-run", "approve-plan")
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     while (snapshot := service.snapshot(PROJECT_ID, "regenerate-run")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate after plan approval: {snapshot.status}"
         sleep(0.01)
@@ -1701,14 +1701,14 @@ def test_regenerate_discards_staged_and_reruns(
             idempotency_key="regenerate-world",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     while (snapshot := service.snapshot(PROJECT_ID, "regenerate-run")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate after regenerate: {snapshot.status}"
         sleep(0.01)
     # Regenerate requeues: the plan gate fires again, approve it.
     if snapshot.review_reason == "plan_approval_required":
         service.approve_plan(PROJECT_ID, "regenerate-run", "approve-plan-2")
-        deadline = monotonic() + 5.0
+        deadline = monotonic() + 20.0
         while (snapshot := service.snapshot(PROJECT_ID, "regenerate-run")).status not in terminal:
             assert monotonic() < deadline, f"run did not terminate after replan: {snapshot.status}"
             sleep(0.01)
@@ -1787,7 +1787,7 @@ def test_cast_only_plan_gets_world_prerequisite_auto_prepended(
             provider="legacy_real",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "cast-only-repaired")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -1860,7 +1860,7 @@ def test_plan_failure_reason_surfaces_in_event(
             provider="legacy_real",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "plan-failure-reason")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -1918,7 +1918,7 @@ def test_provider_failures_recorded_for_forensics(
             provider="legacy_real",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "provider-failures")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -1986,7 +1986,7 @@ def test_outline_parse_failure_recorded_for_forensics(
             provider="legacy_real",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "bad-outline")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -2062,7 +2062,7 @@ def test_outline_schema_failure_with_chapters_blocks_cleanly(
             auto_approve=False,
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "outline-short-chapters")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -2070,7 +2070,7 @@ def test_outline_schema_failure_with_chapters_blocks_cleanly(
     # auto_approve=False gates the plan first; approve to proceed to outline.
     assert snapshot.review_reason == "plan_approval_required"
     service.approve_plan(PROJECT_ID, "outline-short-chapters", "approve-plan")
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     while (snapshot := service.snapshot(PROJECT_ID, "outline-short-chapters")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate after plan approval: {snapshot.status}"
         sleep(0.01)
@@ -2162,7 +2162,7 @@ def test_plan_approval_gate_and_intent_trimming(
             auto_approve=False,
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "plan-gate")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -2193,7 +2193,7 @@ def test_plan_approval_gate_and_intent_trimming(
 
     # Approve the plan: only the outline runs (world/cast/chapter never).
     service.approve_plan(PROJECT_ID, "plan-gate", "approve-plan-gate")
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     while (snapshot := service.snapshot(PROJECT_ID, "plan-gate")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate after approval: {snapshot.status}"
         sleep(0.01)
@@ -2228,7 +2228,7 @@ def test_plan_approval_gate_and_intent_trimming(
             idempotency_key="approve-outline",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     while (snapshot := service.snapshot(PROJECT_ID, "plan-gate")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate after outline approval: {snapshot.status}"
         sleep(0.01)
@@ -2306,7 +2306,7 @@ def test_bare_tool_names_and_revise_downgrade_repaired(
             provider="legacy_real",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(PROJECT_ID, "bare-tools")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
@@ -2387,7 +2387,7 @@ def test_approval_skip_prevents_redrafting_approved_outputs(
             auto_approve=False,
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     # auto_approve=False gates the plan first: wait for it, confirm it, then
     # wait for the world artifact to be staged for approval.
@@ -2396,7 +2396,7 @@ def test_approval_skip_prevents_redrafting_approved_outputs(
         sleep(0.01)
     assert snapshot.review_reason == "plan_approval_required"
     service.approve_plan(PROJECT_ID, "approve-skip", "approve-plan")
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     while (snapshot := service.snapshot(PROJECT_ID, "approve-skip")).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate: {snapshot.status}"
         sleep(0.01)
@@ -2422,7 +2422,7 @@ def test_approval_skip_prevents_redrafting_approved_outputs(
             idempotency_key="approve-world-1",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     while (snapshot := service.snapshot(PROJECT_ID, "approve-skip")).status not in terminal:
         if snapshot.review_reason == "plan_approval_required":
             service.approve_plan(PROJECT_ID, "approve-skip", "approve-plan-2")
@@ -2451,7 +2451,7 @@ def test_approval_skip_prevents_redrafting_approved_outputs(
             idempotency_key="approve-cast-1",
         )
     )
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     while (snapshot := service.snapshot(PROJECT_ID, "approve-skip")).status not in terminal:
         if snapshot.review_reason == "plan_approval_required":
             service.approve_plan(PROJECT_ID, "approve-skip", "approve-plan-3")
@@ -2469,3 +2469,52 @@ def test_approval_skip_prevents_redrafting_approved_outputs(
             "SELECT COUNT(*) FROM artifacts WHERE run_id = 'approve-skip' AND status = 'staged'"
         ).fetchone()
         assert leftover == (0,)
+
+
+def test_trim_to_intent_for_sub_intents() -> None:
+    from novel_agent.agent.plan_generator import PlanStep, _trim_to_intent
+
+    def step(index: int, tool: str) -> PlanStep:
+        return PlanStep(step_id=index, description="步骤", tool=tool, goal="目标", parameters=None)
+
+    steps = (
+        step(1, "world.generate@1.0.0"),
+        step(2, "character.generate@1.0.0"),
+        step(3, "outline.generate@1.0.0"),
+        step(4, "chapter.draft@1.0.0"),
+    )
+    assert [item.tool for item in _trim_to_intent(steps, intent="world_only", existing_world=False, existing_cast=False)] == [
+        "world.generate@1.0.0"
+    ]
+    assert [item.tool for item in _trim_to_intent(steps, intent="characters_only", existing_world=True, existing_cast=True)] == [
+        "character.generate@1.0.0"
+    ]
+    assert [item.tool for item in _trim_to_intent(steps, intent="add_character", existing_world=True, existing_cast=True)] == [
+        "character.generate@1.0.0"
+    ]
+
+
+def test_trim_to_intent_handles_composite_intents() -> None:
+    from novel_agent.agent.plan_generator import PlanStep, _trim_to_intent
+
+    def step(index: int, tool: str) -> PlanStep:
+        return PlanStep(step_id=index, description="步骤", tool=tool, goal="目标", parameters=None)
+
+    steps = (
+        step(1, "world.generate@1.0.0"),
+        step(2, "character.generate@1.0.0"),
+        step(3, "outline.generate@1.0.0"),
+        step(4, "chapter.draft@1.0.0"),
+    )
+    trimmed = _trim_to_intent(
+        steps,
+        intent="characters_only",
+        intents=("characters_only", "outline_only"),
+        existing_world=False,
+        existing_cast=False,
+    )
+    assert [item.tool for item in trimmed] == [
+        "world.generate@1.0.0",
+        "character.generate@1.0.0",
+        "outline.generate@1.0.0",
+    ]

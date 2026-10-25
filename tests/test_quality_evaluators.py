@@ -35,6 +35,10 @@ def _request() -> EvaluatorAdapterRequest:
         chapter_plan_id="chapter-plan-1",
         chapter_number=1,
         required_beats=("抵达学院", "遇见阿泽"),
+        style_guidance=("冷峻克制",),
+        world_rules=("魔法不可复活死者",),
+        acceptance_criteria=("主角必须出场",),
+        previous_summary="上一章：抵达学院。",
         characters=(
             CharacterFixture(character_id="c-1", name="林晚", aliases=("晚晚",)),
             CharacterFixture(character_id="c-2", name="阿泽"),
@@ -60,6 +64,10 @@ def test_provider_evaluator_returns_validated_report_json() -> None:
     assert len(transport.prompts) == 1
     assert "苛刻的小说评审编辑" in transport.prompts[0]
     assert "林晚" in transport.prompts[0]
+    assert "冷峻克制" in transport.prompts[0]
+    assert "魔法不可复活死者" in transport.prompts[0]
+    assert "主角必须出场" in transport.prompts[0]
+    assert "上一章：抵达学院。" in transport.prompts[0]
 
 
 def test_provider_evaluator_failure_returns_empty_string() -> None:

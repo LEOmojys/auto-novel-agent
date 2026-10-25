@@ -7,7 +7,13 @@ from threading import RLock
 from pydantic import ValidationError
 
 from novel_agent.contracts import ToolOutcome
-from novel_agent.tool_call_persistence import decode_persisted_result, persist_result, reserve_result
+from novel_agent.tool_call_persistence import (
+    decode_persisted_result,
+    persist_result,
+    record_result,
+    reserve_result,
+)
+from novel_agent.tool_runtime import ToolCancelledError
 from novel_agent.tool_models import (
     AccessLevel,
     AgentRole,
@@ -73,7 +79,14 @@ class ToolGateway:
         ledger_key = (request.run_id, request.idempotency_key)
         prior = self._completed.get(ledger_key) if self._connection is None else None
         if spec.idempotent and self._connection is not None:
-            reservation = reserve_result(self._connection, request, spec, input_hash)
+            reservation = reserve_result(
+                self._connection,
+                request,
+                spec,
+                input_hash,
+                max_attempts=spec.retry_policy.max_attempts,
+                retry_after_seconds=spec.retry_policy.retry_after_seconds,
+            )
             if reservation.tool_id != spec.tool_ref or reservation.request_sha256 != input_hash:
                 return self._denied(request, input_hash, "IDEMPOTENCY_CONFLICT")
             if reservation.status == "existing":
@@ -94,6 +107,10 @@ class ToolGateway:
             parsed_input = spec.input_model.model_validate(request.input_data.model_dump())
             raw_output = handler(parsed_input)
             output = spec.output_model.model_validate(raw_output.model_dump())
+        except ToolCancelledError:
+            # Cancellation/timeout is control flow, not a domain failure: let the
+            # loop mark the tool as aborted instead of surfacing HANDLER_FAILED.
+            raise
         except ValidationError:
             return self._finish(request, spec, input_hash, ledger_key, self._result(
                 request,
@@ -123,6 +140,8 @@ class ToolGateway:
             self._completed[ledger_key] = (input_hash, result)
             if self._connection is not None:
                 persist_result(self._connection, request, spec, result, input_hash)
+        elif spec.audit_calls and self._connection is not None:
+            record_result(self._connection, request, spec, result, input_hash)
         return self._record(result)
 
     @staticmethod

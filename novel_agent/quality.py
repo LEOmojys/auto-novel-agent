@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum, unique
 from typing import Final, Protocol
@@ -9,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from novel_agent.pathing import ProjectId
 
 
-POLICY_VERSION: Final = "1.0.0"
+POLICY_VERSION: Final = "1.1.0"
 
 
 class QualityModel(BaseModel):
@@ -32,12 +33,17 @@ class QualityPolicy(QualityModel):
     minimum_mean_score: float = 3.5
     maximum_repairs: int = Field(default=2, ge=0)
     maximum_evaluator_attempts: int = Field(default=2, gt=0)
+    #: When a cast is available, at least this many cast members must appear.
+    minimum_mentioned_characters: int = Field(default=0, ge=0)
 
 
 class CharacterFixture(QualityModel):
     character_id: str
     name: str
     aliases: tuple[str, ...] = ()
+    role: str = ""
+    goal: str = ""
+    traits: tuple[str, ...] = ()
 
 
 class ChapterQualityRequest(QualityModel):
@@ -55,6 +61,10 @@ class ChapterQualityRequest(QualityModel):
     located_beats: tuple[str, ...] = ()
     continuity_hard_conflicts: tuple[str, ...] = ()
     repair_attempts: int = Field(default=0, ge=0)
+    style_guidance: tuple[str, ...] = ()
+    world_rules: tuple[str, ...] = ()
+    acceptance_criteria: tuple[str, ...] = ()
+    previous_summary: str = ""
 
 
 class ChapterMetrics(QualityModel):
@@ -105,6 +115,10 @@ class EvaluatorAdapterRequest(QualityModel):
     chapter_number: int
     required_beats: tuple[str, ...]
     characters: tuple[CharacterFixture, ...]
+    style_guidance: tuple[str, ...] = ()
+    world_rules: tuple[str, ...] = ()
+    acceptance_criteria: tuple[str, ...] = ()
+    previous_summary: str = ""
 
 
 class StructuredEvaluator(Protocol):
@@ -127,6 +141,8 @@ class QualityDecision(QualityModel):
     evaluator_attempts: int
     policy_version: str
     metrics: ChapterMetrics | None
+    #: Human/model-readable reasons for the failing dimensions (repair input).
+    feedback: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +174,10 @@ class ProjectScopedEvaluationAdapter:
             chapter_number=request.chapter_number,
             required_beats=request.required_beats,
             characters=self.characters,
+            style_guidance=request.style_guidance,
+            world_rules=request.world_rules,
+            acceptance_criteria=request.acceptance_criteria,
+            previous_summary=request.previous_summary,
         )
         report: EvaluatorReport | None = None
         attempts = 0
@@ -179,14 +199,35 @@ class ProjectScopedEvaluationAdapter:
             )
 
         failures: list[str] = []
+        feedback: list[str] = []
         if not policy.minimum_length_ratio <= metrics.length_ratio <= policy.maximum_length_ratio:
             failures.append("length_ratio")
-        if any(dimension.score < policy.minimum_dimension_score for dimension in report.dimensions):
+            feedback.append(
+                f"length_ratio: {metrics.chinese_characters}/{metrics.target_chinese_characters}"
+            )
+        below = [
+            (name, dimension)
+            for name, dimension in zip(_DIMENSION_NAMES, report.dimensions)
+            if dimension.score < policy.minimum_dimension_score
+        ]
+        if below:
             failures.append("dimension_below_minimum")
+            feedback.extend(f"{name}: {dimension.reason}" for name, dimension in below)
         if report.mean_score < policy.minimum_mean_score:
             failures.append("mean_below_minimum")
-        if frozenset(request.required_beats) - frozenset(request.located_beats):
+            feedback.append(f"mean_score: {report.mean_score:.2f}")
+        missing_beats = [
+            beat for beat in request.required_beats if not _beat_covered(beat, request.located_beats)
+        ]
+        if missing_beats:
             failures.append("missing_plan_beat")
+            feedback.extend(f"missing_plan_beat: {beat}" for beat in missing_beats)
+        if self.characters and len(metrics.mentioned_character_ids) < policy.minimum_mentioned_characters:
+            failures.append("missing_character_coverage")
+            feedback.append(
+                f"missing_character_coverage: {len(metrics.mentioned_character_ids)}"
+                f"/{policy.minimum_mentioned_characters}"
+            )
         if not failures:
             return QualityDecision(
                 outcome=QualityOutcome.ACCEPT,
@@ -195,6 +236,7 @@ class ProjectScopedEvaluationAdapter:
                 evaluator_attempts=attempts,
                 policy_version=policy.version,
                 metrics=metrics,
+                feedback=(),
             )
         if request.repair_attempts >= policy.maximum_repairs:
             return QualityDecision(
@@ -204,6 +246,7 @@ class ProjectScopedEvaluationAdapter:
                 evaluator_attempts=attempts,
                 policy_version=policy.version,
                 metrics=metrics,
+                feedback=tuple(feedback),
             )
         return QualityDecision(
             outcome=QualityOutcome.REPAIR,
@@ -212,6 +255,7 @@ class ProjectScopedEvaluationAdapter:
             evaluator_attempts=attempts,
             policy_version=policy.version,
             metrics=metrics,
+            feedback=tuple(feedback),
         )
 
     def _hard_failure(self, request: ChapterQualityRequest) -> str | None:
@@ -229,6 +273,40 @@ class ProjectScopedEvaluationAdapter:
         if request.continuity_hard_conflicts:
             return "continuity_hard_conflict"
         return None
+
+_DIMENSION_NAMES: Final = (
+    "style_consistency",
+    "character_consistency",
+    "prose_fluency",
+    "scene_completeness",
+    "dialogue_naturalness",
+    "content_alignment",
+)
+
+
+def _normalise_beat(text: str) -> str:
+    return re.sub(r"[\s\W_]+", "", text.lower())
+
+
+def _beat_covered(required: str, located: tuple[str, ...]) -> bool:
+    """Match a planned beat even when the auditor paraphrased it."""
+    target = _normalise_beat(required)
+    if not target:
+        return True
+    for candidate in located:
+        normalised = _normalise_beat(candidate)
+        if not normalised:
+            continue
+        if target in normalised or normalised in target:
+            return True
+        target_bigrams = {target[index : index + 2] for index in range(max(1, len(target) - 1))}
+        candidate_bigrams = {
+            normalised[index : index + 2] for index in range(max(1, len(normalised) - 1))
+        }
+        if target_bigrams and len(target_bigrams & candidate_bigrams) / len(target_bigrams) >= 0.6:
+            return True
+    return False
+
 
 __all__ = (
     "CharacterFixture",

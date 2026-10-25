@@ -99,6 +99,10 @@ def quality_request(
         located_beats=located_beats,
         continuity_hard_conflicts=hard_conflicts,
         repair_attempts=repair_attempt,
+        style_guidance=request.style_guidance,
+        world_rules=request.world_rules,
+        acceptance_criteria=request.acceptance_criteria,
+        previous_summary=request.previous_summary,
     )
 
 
@@ -106,6 +110,7 @@ def repair_brief(
     chapter: ChapterPlan,
     repair_attempt: int,
     failure_codes: tuple[str, ...],
+    failure_details: tuple[str, ...],
     context: ContextBuildResult,
     staged: StagedChapter,
 ) -> RepairBrief:
@@ -113,6 +118,7 @@ def repair_brief(
         chapter_plan=chapter,
         repair_attempt=repair_attempt,
         failure_codes=failure_codes,
+        failure_details=failure_details,
         context_digest=context.digest,
         evidence_artifact_id=staged.artifact_id,
         evidence_artifact_revision=staged.revision,

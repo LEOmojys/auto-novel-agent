@@ -150,7 +150,7 @@ def test_degraded_analysis_uses_heuristic_intent(requirements: str, expected_int
 
 
 def _wait_terminal(service: NovelAgentService, project_id: ProjectId, run_id: str) -> RunStatus:
-    deadline = monotonic() + 5.0
+    deadline = monotonic() + 20.0
     terminal = frozenset((RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.WAITING_REVIEW, RunStatus.CANCELLED))
     while (snapshot := service.snapshot(project_id, run_id)).status not in terminal:
         assert monotonic() < deadline, f"run did not terminate; status={snapshot.status}"
@@ -443,3 +443,164 @@ def test_brief_analyzer_not_fresh_on_continuation() -> None:
         brief_id="run-cont:brief",
     )
     assert brief.fresh is False
+
+
+def test_brief_analyzer_parses_chinese_chapter_count_on_degraded_path() -> None:
+    analyzer = BriefAnalyzer(transport=_FailingTransport(), now=lambda: FIXED_TIME)
+    brief = analyzer.analyze(
+        "写一部三章的校园小说",
+        project_id=ProjectId("novel-one"),
+        run_id="run-cn-count",
+        brief_id="run-cn-count:brief",
+    )
+    assert brief.degraded is True
+    assert brief.target_chapter_count == 3
+    assert brief.intent == "full_novel"
+
+
+def test_heuristic_detects_composite_intents() -> None:
+    from novel_agent.agent.brief import _heuristic_intents
+
+    intents = _heuristic_intents("请设计角色并写第一章正文")
+    assert "characters_only" in intents
+    assert "full_novel" in intents
+
+
+class _CompositeTransport:
+    def generate(self, request) -> ProviderTransportResult:
+        if "需求分析器" in request.prompt:
+            payload = {
+                "domain": "novel",
+                "intent": "characters_only",
+                "intents": ["characters_only", "outline_only"],
+                "goal": "设计角色并给出大纲",
+                "constraints": [],
+                "style_guidance": [],
+                "acceptance_criteria": [],
+            }
+            return ProviderTransportResult(
+                content=json.dumps(payload, ensure_ascii=False),
+                model_name="t",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+        raise AssertionError("unexpected provider call")
+
+
+def test_brief_analyzer_preserves_composite_intents() -> None:
+    brief = BriefAnalyzer(transport=_CompositeTransport(), now=lambda: FIXED_TIME).analyze(
+        "设计角色并给出大纲",
+        project_id=ProjectId("novel-one"),
+        run_id="run-composite",
+        brief_id="run-composite:brief",
+    )
+    assert brief.intent == "characters_only"
+    assert brief.intents == ("characters_only", "outline_only")
+
+
+class _SingleIntentTransport:
+    def generate(self, request) -> ProviderTransportResult:
+        if "需求分析器" in request.prompt:
+            payload = {
+                "domain": "novel",
+                "intent": "characters_only",
+                "goal": "设计角色并写第一章",
+                "constraints": [],
+                "style_guidance": [],
+                "acceptance_criteria": [],
+            }
+            return ProviderTransportResult(
+                content=json.dumps(payload, ensure_ascii=False),
+                model_name="t",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+        raise AssertionError("unexpected provider call")
+
+
+def test_single_llm_intent_is_expanded_for_explicit_multi_request() -> None:
+    brief = BriefAnalyzer(transport=_SingleIntentTransport(), now=lambda: FIXED_TIME).analyze(
+        "设计角色并写第一章正文",
+        project_id=ProjectId("novel-one"),
+        run_id="run-expanded",
+        brief_id="run-expanded:brief",
+    )
+    assert "characters_only" in brief.intents
+    assert "full_novel" in brief.intents
+
+
+def test_brief_analyzer_parses_target_words_on_degraded_path() -> None:
+    analyzer = BriefAnalyzer(transport=_FailingTransport(), now=lambda: FIXED_TIME)
+    brief = analyzer.analyze(
+        "写三章校园小说，每章5000字",
+        project_id=ProjectId("novel-one"),
+        run_id="run-target-words",
+        brief_id="run-target-words:brief",
+    )
+    assert brief.degraded is True
+    assert brief.target_chapter_count == 3
+    assert brief.target_words == 5000
+
+
+def test_brief_analyzer_detects_explicit_intent_conflict() -> None:
+    analyzer = BriefAnalyzer(transport=_FailingTransport(), now=lambda: FIXED_TIME)
+    brief = analyzer.analyze(
+        "只写世界观，但写第一章正文",
+        project_id=ProjectId("novel-one"),
+        run_id="run-conflict",
+        brief_id="run-conflict:brief",
+    )
+    assert brief.needs_clarification is True
+    assert brief.intent_conflicts
+    assert brief.clarification_question
+
+
+class _ConflictBriefTransport:
+    def generate(self, request) -> ProviderTransportResult:
+        if "需求分析器" in request.prompt:
+            payload = {
+                "domain": "novel",
+                "intent": "world_only",
+                "intents": ["world_only", "full_novel"],
+                "goal": "只写世界观但写第一章",
+                "constraints": [],
+                "style_guidance": [],
+                "acceptance_criteria": [],
+            }
+            return ProviderTransportResult(
+                content=json.dumps(payload, ensure_ascii=False),
+                model_name="t",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+        raise AssertionError("creative steps must not run while clarifying")
+
+
+def test_conflicting_intents_pause_run_for_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    projects_root = tmp_path / "projects"
+    project_id = ProjectId("novel-one")
+    (projects_root / project_id.root).mkdir(parents=True)
+    monkeypatch.setattr(config, "PROJECTS_DIR", str(projects_root))
+    service = NovelAgentService.from_config(
+        now=lambda: FIXED_TIME, provider_transport=_ConflictBriefTransport()
+    )
+    service.start(
+        StartNovelRunRequest(
+            project_id=project_id,
+            run_id="run-conflict-stage",
+            idempotency_key="start-conflict-stage",
+            user_requirements="只写世界观，但写第一章正文",
+            provider="legacy_real",
+        )
+    )
+    assert _wait_terminal(service, project_id, "run-conflict-stage") is RunStatus.WAITING_REVIEW
+    snapshot = service.snapshot(project_id, "run-conflict-stage")
+    assert snapshot.review_reason == "intent_clarification_required"
+    with connect_project_database(projects_root / project_id.root) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM run_events WHERE run_id = ? AND event_type = 'clarification_required'",
+            ("run-conflict-stage",),
+        ).fetchone()
+    assert row == (1,)

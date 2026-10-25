@@ -76,7 +76,13 @@ class LazyProviderQualityReviewer:
         except Exception:  # noqa: BROAD_EXCEPT_OK - malformed cast must pause, not pass
             return None
         fixtures = tuple(
-            CharacterFixture(character_id=character.character_id, name=character.name)
+            CharacterFixture(
+                character_id=character.character_id,
+                name=character.name,
+                role=character.role,
+                goal=character.goal,
+                traits=character.traits,
+            )
             for character in cast.characters
         )
         return ProjectScopedEvaluationAdapter(

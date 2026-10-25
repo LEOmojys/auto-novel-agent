@@ -24,6 +24,9 @@ class ChapterExecutionRequest(BaseModel):
     target_chinese_characters: int = Field(gt=0)
     genre: str = Field(min_length=1)
     style_guidance: tuple[str, ...] = ()
+    world_rules: tuple[str, ...] = ()
+    acceptance_criteria: tuple[str, ...] = ()
+    previous_summary: str = ""
     activate: bool = True
     auto_approve: bool = True
 
@@ -49,6 +52,7 @@ class RepairBrief(BaseModel):
     chapter_plan: ChapterPlan
     repair_attempt: int = Field(ge=1, le=2)
     failure_codes: tuple[str, ...]
+    failure_details: tuple[str, ...] = ()
     context_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     evidence_artifact_id: ArtifactId
     evidence_artifact_revision: int = Field(ge=1)

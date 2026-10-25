@@ -29,6 +29,7 @@ from novel_agent.local_run_scheduler import LocalRunScheduler
 from novel_agent.memory_promotion import promote_candidates
 from novel_agent.memory_review import MemoryReviewService
 from novel_agent.pathing import ArtifactId, ProjectId, ProjectPathResolver
+from novel_agent.quality_gate import quality_accepted
 from novel_agent.revision_models import RebaseConfirmation
 from novel_agent.run_coordinator import RunCoordinator
 from novel_agent.run_event_store import append_run_event
@@ -1174,6 +1175,8 @@ def _approve_chapter(
         parse_route=str(draft.get("parse_route") or "approval"),
         generation_attempt=int(draft.get("generation_attempt") or 1),
     )
+    if not quality_accepted(connection, artifact_id, revision):
+        raise RunTransitionError(run_id, "quality_not_accepted", "approve chapter")
     # Persist the staged revision as the current accepted chapter.
     updated = connection.execute(
         "UPDATE artifacts SET status = 'accepted', is_current = 1 WHERE artifact_id = ? AND revision = ? "
